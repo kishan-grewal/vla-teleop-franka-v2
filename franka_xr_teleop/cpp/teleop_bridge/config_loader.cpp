@@ -100,6 +100,14 @@ bool LoadTeleopConfig(const std::string& path, AppConfig* config, std::string* e
   }
   ReadScalar(teleop, "allow_motion", &config->bridge.allow_motion);
   ReadScalar(teleop, "dry_run", &config->dry_run);
+  std::string control_source;
+  if (ReadScalar(teleop, "control_source", &control_source) ||
+      ReadScalar(teleop, "input_source", &control_source)) {
+    if (!ParseControlSource(control_source, &config->bridge.control_source)) {
+      *error = "Unsupported teleop.control_source '" + control_source + "' in " + path;
+      return false;
+    }
+  }
   ReadScalar(teleop,
              "a_button_toggles_robot_control",
              &config->bridge.teleop.a_button_toggles_robot_control);
@@ -189,6 +197,15 @@ bool LoadTeleopConfig(const std::string& path, AppConfig* config, std::string* e
     ReadScalar(gripper, "grasp_force_n", &config->bridge.gripper.grasp_force_n);
   }
 
+  if (const YAML::Node policy = teleop["policy"]; policy && policy.IsMap()) {
+    ReadScalar(policy, "bind_ip", &config->bridge.policy.bind_ip);
+    int action_port = static_cast<int>(config->bridge.policy.action_port);
+    if (ReadScalar(policy, "action_port", &action_port)) {
+      config->bridge.policy.action_port = static_cast<uint16_t>(action_port);
+    }
+    ReadScalar(policy, "command_timeout_s", &config->bridge.policy.command_timeout_s);
+  }
+
   return true;
 }
 
@@ -236,6 +253,14 @@ bool LoadAppConfig(const std::string& config_dir, AppConfig* config, std::string
   }
   if (config->bridge.teleop.planner_rate_hz <= 1.0) {
     *error = "teleop.planner_rate_hz must be > 1.0";
+    return false;
+  }
+  if (config->bridge.policy.action_port == 0) {
+    *error = "teleop.policy.action_port must be in [1, 65535]";
+    return false;
+  }
+  if (config->bridge.policy.command_timeout_s <= 0.0) {
+    *error = "teleop.policy.command_timeout_s must be > 0";
     return false;
   }
   if (config->bridge.teleop.control_trigger_threshold < 0.0 ||

@@ -1,5 +1,6 @@
 teleop:
   xr_input_source: xrobotics_sdk
+  control_source: xr
   observation_ip: 127.0.0.1
   observation_port: 28081
   allow_motion: true
@@ -19,6 +20,10 @@ teleop:
   xr_hold_dwell_s: 0.12
   planner_rate_hz: 100.0
   start_joint_positions_rad: [-0.03172855768968763, -1.463935324983971, 0.07933473784803836, -2.86077989514297, 0.05852869658116116, 2.345908166150277, 0.8116081573698255]
+  policy:
+    bind_ip: 0.0.0.0
+    action_port: 28082
+    command_timeout_s: 0.20
   ik:
     damping: 0.08
     nullspace_gain: 0.0

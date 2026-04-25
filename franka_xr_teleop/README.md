@@ -136,6 +136,36 @@ Live teleop:
   --obs-port 28081
 ```
 
+SmolVLA policy control keeps the same robot execution path, but replaces XR
+controller input with 7D Cartesian actions over UDP:
+
+```bash
+./build/cpp/teleop_bridge/franka_xr_teleop_bridge \
+  --robot-ip 192.168.2.200 \
+  --obs-port 28081 \
+  --control-source policy \
+  --policy-action-port 28082
+```
+
+In another terminal, run the policy sidecar:
+
+```bash
+./tools/run_smolvla_policy.py \
+  --policy-path /home/kishan/industry-project/SmolVLA-Testing/outputs/001_smolvla \
+  --obs-port 28081 \
+  --bridge-ip 127.0.0.1 \
+  --action-port 28082 \
+  --top-camera 0 \
+  --third-person-camera 1 \
+  --task "your task instruction"
+```
+
+For a bridge smoke test without loading a model or cameras:
+
+```bash
+./tools/run_smolvla_policy.py --zero-actions --obs-port 28081 --action-port 28082
+```
+
 Record one dataset session from the UDP robot stream plus the configured
 cameras:
 
