@@ -23,6 +23,11 @@ enum class ControlMode : uint8_t {
   kPose = 2,
 };
 
+enum class ControlSource : uint8_t {
+  kXr = 0,
+  kPolicy = 1,
+};
+
 enum class GripperCommandMode : uint8_t {
   kAnalog = 0,
   kBinary = 1,
@@ -47,6 +52,16 @@ inline const char* ToString(ControlMode mode) {
   return "UNKNOWN";
 }
 
+inline const char* ToString(ControlSource source) {
+  switch (source) {
+    case ControlSource::kXr:
+      return "XR";
+    case ControlSource::kPolicy:
+      return "POLICY";
+  }
+  return "UNKNOWN";
+}
+
 inline bool ParseControlMode(std::string_view value, ControlMode* mode) {
   if (value == "position") {
     *mode = ControlMode::kPosition;
@@ -58,6 +73,18 @@ inline bool ParseControlMode(std::string_view value, ControlMode* mode) {
   }
   if (value == "hold") {
     *mode = ControlMode::kHold;
+    return true;
+  }
+  return false;
+}
+
+inline bool ParseControlSource(std::string_view value, ControlSource* source) {
+  if (value == "xr" || value == "xrobotics" || value == "xrobotics_sdk") {
+    *source = ControlSource::kXr;
+    return true;
+  }
+  if (value == "policy" || value == "smolvla") {
+    *source = ControlSource::kPolicy;
     return true;
   }
   return false;
@@ -109,6 +136,15 @@ struct TeleopAction {
   std::array<double, 3> delta_translation_m{};
   std::array<double, 3> delta_rotation_rad{};  // angle-axis
   double gripper_command = 0.0;                // normalized gripper state in [0, 1]
+};
+
+struct PolicyActionCommand {
+  uint64_t timestamp_ns = 0;
+  uint64_t sequence_id = 0;
+  TeleopAction action{};
+  bool enabled = false;
+  bool episode_start = false;
+  bool episode_end = false;
 };
 
 struct FaultFlags {
@@ -183,6 +219,9 @@ struct SafetyLimits {
 
 struct TeleopRuntimeConfig {
   ControlMode control_mode = ControlMode::kPose;
+  // Mirror the XR client "Switch w/ A Button" option. When enabled, the bridge
+  // does not treat A as an episode-start button.
+  bool a_button_toggles_robot_control = false;
   // Translation gain: robot_delta_m = scale_factor * xr_delta_m.
   // Values > 1.0 make the robot move farther than your hand (more
   // responsive), < 1.0 attenuate for fine-grained control.
@@ -254,9 +293,17 @@ struct RobotLoadConfig {
   std::array<double, 9> inertia_kgm2{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
 };
 
+struct PolicyRuntimeConfig {
+  std::string bind_ip = "0.0.0.0";
+  uint16_t action_port = 28082;
+  double command_timeout_s = 0.20;
+};
+
 struct TeleopBridgeConfig {
   SafetyLimits safety{};
   TeleopRuntimeConfig teleop{};
+  ControlSource control_source = ControlSource::kXr;
+  PolicyRuntimeConfig policy{};
   GripperConfig gripper{};
   IkConfig ik{};
   RobotLoadConfig load{};
@@ -298,6 +345,7 @@ class LatestValueBuffer {
 };
 
 using LatestCommandBuffer = LatestValueBuffer<XRCommand>;
+using LatestPolicyActionBuffer = LatestValueBuffer<PolicyActionCommand>;
 using LatestObservationBuffer = LatestValueBuffer<RobotObservation>;
 using LatestRobotStateBuffer = LatestValueBuffer<RobotSnapshot>;
 using LatestPlannedTargetBuffer = LatestValueBuffer<PlannedTarget>;

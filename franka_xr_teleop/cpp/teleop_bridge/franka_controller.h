@@ -25,6 +25,7 @@ class FrankaTeleopController {
   FrankaTeleopController(const FrankaControllerOptions& options,
                          const TeleopBridgeConfig& config,
                          const LatestCommandBuffer* command_buffer,
+                         const LatestPolicyActionBuffer* policy_action_buffer,
                          LatestObservationBuffer* observation_buffer);
 
   // Blocking call. Returns 0 on clean stop, non-zero on error.
@@ -34,6 +35,7 @@ class FrankaTeleopController {
   FrankaControllerOptions options_{};
   TeleopBridgeConfig config_{};
   const LatestCommandBuffer* command_buffer_;
+  const LatestPolicyActionBuffer* policy_action_buffer_;
   LatestObservationBuffer* observation_buffer_;
 };
 

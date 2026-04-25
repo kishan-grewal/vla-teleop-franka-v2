@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -14,6 +15,7 @@
 #include "config_loader.h"
 #include "franka_controller.h"
 #include "observation_pub.h"
+#include "policy_action_source.h"
 #include "xrobotics_source.h"
 
 namespace {
@@ -38,6 +40,12 @@ struct Options {
   uint16_t obs_port = 28081;
   bool control_mode_override = false;
   teleop::ControlMode control_mode = teleop::ControlMode::kPose;
+  bool control_source_override = false;
+  teleop::ControlSource control_source = teleop::ControlSource::kXr;
+  bool policy_bind_ip_override = false;
+  std::string policy_bind_ip;
+  bool policy_action_port_override = false;
+  uint16_t policy_action_port = 28082;
   bool trace_enabled = false;
   std::string trace_dir = "teleop_trace";
   uint32_t trace_planner_decimation = 1;
@@ -49,12 +57,14 @@ void PrintUsage(const char* prog) {
   std::cout << "Usage:\n"
             << "  " << prog << " [--config-dir configs] [--dry-run] [--no-motion]\n"
             << "             [--robot-ip <ip>] [--obs-ip <ip>] [--obs-port <port>]\n"
-            << "             [--control-mode <pose|position>] [--save-home]\n"
+            << "             [--control-mode <pose|position>] [--control-source <xr|policy>]\n"
+            << "             [--policy-bind-ip <ip>] [--policy-action-port <port>] [--save-home]\n"
             << "             [--trace-dir <dir>] [--trace-planner-decimation <N>] "
                "[--trace-rt-decimation <N>]\n\n"
             << "Examples:\n"
             << "  " << prog << " --dry-run\n"
             << "  " << prog << " --robot-ip 192.168.2.200 --control-mode position\n"
+            << "  " << prog << " --robot-ip 192.168.2.200 --control-source policy\n"
             << "  " << prog << " --robot-ip 192.168.2.200 --save-home\n"
             << "  " << prog << " --robot-ip 192.168.2.200 --trace-dir trace_run_01\n";
 }
@@ -112,6 +122,32 @@ bool ParseArgs(int argc, char** argv, Options* out) {
         return false;
       }
       out->control_mode_override = true;
+      continue;
+    }
+    if (arg == "--control-source") {
+      if (i + 1 >= argc) {
+        return false;
+      }
+      if (!teleop::ParseControlSource(argv[++i], &out->control_source)) {
+        return false;
+      }
+      out->control_source_override = true;
+      continue;
+    }
+    if (arg == "--policy-bind-ip") {
+      if (i + 1 >= argc) {
+        return false;
+      }
+      out->policy_bind_ip_override = true;
+      out->policy_bind_ip = argv[++i];
+      continue;
+    }
+    if (arg == "--policy-action-port") {
+      if (i + 1 >= argc) {
+        return false;
+      }
+      out->policy_action_port_override = true;
+      out->policy_action_port = static_cast<uint16_t>(std::stoi(argv[++i]));
       continue;
     }
     if (arg == "--trace-dir") {
@@ -220,6 +256,15 @@ int main(int argc, char** argv) {
   if (options.control_mode_override) {
     config.bridge.teleop.control_mode = options.control_mode;
   }
+  if (options.control_source_override) {
+    config.bridge.control_source = options.control_source;
+  }
+  if (options.policy_bind_ip_override) {
+    config.bridge.policy.bind_ip = options.policy_bind_ip;
+  }
+  if (options.policy_action_port_override) {
+    config.bridge.policy.action_port = options.policy_action_port;
+  }
 
   if (options.save_home) {
     try {
@@ -245,14 +290,33 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, HandleSignal);
 
   teleop::LatestCommandBuffer command_buffer;
+  teleop::LatestPolicyActionBuffer policy_action_buffer;
   teleop::LatestObservationBuffer observation_buffer;
 
-  teleop::XrRoboticsSource xr_source(&command_buffer, &g_stop_requested);
-  if (!xr_source.Start()) {
-    std::cerr << "Failed to initialize XRoboToolkit SDK source.\n"
-              << "Ensure XRoboToolkit PC Service is installed and running "
-              << "(for example /opt/apps/roboticsservice/runService.sh).\n";
-    return 2;
+  std::unique_ptr<teleop::XrRoboticsSource> xr_source;
+  std::unique_ptr<teleop::PolicyActionSource> policy_action_source;
+  if (config.bridge.control_source == teleop::ControlSource::kXr) {
+    xr_source = std::make_unique<teleop::XrRoboticsSource>(&command_buffer, &g_stop_requested);
+    if (!xr_source->Start()) {
+      std::cerr << "Failed to initialize XRoboToolkit SDK source.\n"
+                << "Ensure XRoboToolkit PC Service is installed and running "
+                << "(for example /opt/apps/roboticsservice/runService.sh).\n";
+      return 2;
+    }
+  } else {
+    policy_action_source = std::make_unique<teleop::PolicyActionSource>(
+        config.bridge.policy.bind_ip,
+        config.bridge.policy.action_port,
+        &policy_action_buffer,
+        &g_stop_requested);
+    if (!policy_action_source->Start()) {
+      std::cerr << "Failed to initialize policy action source on "
+                << config.bridge.policy.bind_ip << ":" << config.bridge.policy.action_port << ".\n";
+      return 2;
+    }
+    std::cout << "Policy action source listening on udp://" << config.bridge.policy.bind_ip << ":"
+              << config.bridge.policy.action_port
+              << " timeout_s=" << config.bridge.policy.command_timeout_s << "\n";
   }
 
   teleop::ObservationPublisher observation_pub(config.observation_ip, config.observation_port);
@@ -267,25 +331,43 @@ int main(int argc, char** argv) {
   });
 
   if (config.dry_run) {
-    std::cout << "Dry-run mode: receiving XR state via XRoboToolkit PC Service callbacks\n";
+    std::cout << "Dry-run mode: control_source=" << teleop::ToString(config.bridge.control_source)
+              << "\n";
     uint64_t last_print_ns = 0;
     while (!g_stop_requested.load(std::memory_order_acquire)) {
       const uint64_t now_ns = MonotonicNowNs();
       if (now_ns - last_print_ns > 500000000ULL) {
-        const teleop::XRCommand cmd = command_buffer.ReadLatest();
-        const uint64_t age_ns = now_ns > cmd.timestamp_ns ? (now_ns - cmd.timestamp_ns) : 0;
-        std::cout << "server_connected=" << (xr_source.server_connected() ? 1 : 0)
-                  << " device_connected=" << (xr_source.device_connected() ? 1 : 0)
-                  << " rx_count=" << xr_source.received_count()
-                  << " dropped=" << xr_source.dropped_count()
-                  << " seq=" << cmd.sequence_id
-                  << " age_ms=" << (age_ns * 1e-6)
-                  << " right_grip=" << cmd.control_trigger_value
-                  << " right_trigger=" << cmd.gripper_trigger_value
-                  << " A=" << (cmd.button_a ? 1 : 0)
-                  << " B=" << (cmd.button_b ? 1 : 0)
-                  << " right_axis_click=" << (cmd.right_axis_click ? 1 : 0)
-                  << "\n";
+        if (config.bridge.control_source == teleop::ControlSource::kXr) {
+          const teleop::XRCommand cmd = command_buffer.ReadLatest();
+          const uint64_t age_ns = now_ns > cmd.timestamp_ns ? (now_ns - cmd.timestamp_ns) : 0;
+          std::cout << "server_connected=" << (xr_source->server_connected() ? 1 : 0)
+                    << " device_connected=" << (xr_source->device_connected() ? 1 : 0)
+                    << " rx_count=" << xr_source->received_count()
+                    << " dropped=" << xr_source->dropped_count()
+                    << " seq=" << cmd.sequence_id
+                    << " age_ms=" << (age_ns * 1e-6)
+                    << " right_grip=" << cmd.control_trigger_value
+                    << " right_trigger=" << cmd.gripper_trigger_value
+                    << " A=" << (cmd.button_a ? 1 : 0)
+                    << " B=" << (cmd.button_b ? 1 : 0)
+                    << " right_axis_click=" << (cmd.right_axis_click ? 1 : 0)
+                    << "\n";
+        } else {
+          const teleop::PolicyActionCommand cmd = policy_action_buffer.ReadLatest();
+          const uint64_t age_ns = now_ns > cmd.timestamp_ns ? (now_ns - cmd.timestamp_ns) : 0;
+          std::cout << "policy_rx_count=" << policy_action_source->received_count()
+                    << " dropped=" << policy_action_source->dropped_count()
+                    << " seq=" << cmd.sequence_id
+                    << " age_ms=" << (age_ns * 1e-6)
+                    << " enabled=" << (cmd.enabled ? 1 : 0)
+                    << " action=[" << cmd.action.delta_translation_m[0] << ","
+                    << cmd.action.delta_translation_m[1] << ","
+                    << cmd.action.delta_translation_m[2] << ","
+                    << cmd.action.delta_rotation_rad[0] << ","
+                    << cmd.action.delta_rotation_rad[1] << ","
+                    << cmd.action.delta_rotation_rad[2] << ","
+                    << cmd.action.gripper_command << "]\n";
+        }
         last_print_ns = now_ns;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -298,11 +380,20 @@ int main(int argc, char** argv) {
     controller_options.trace.planner_decimation = options.trace_planner_decimation;
     controller_options.trace.rt_decimation = options.trace_rt_decimation;
     teleop::FrankaTeleopController controller(
-        controller_options, config.bridge, &command_buffer, &observation_buffer);
+        controller_options,
+        config.bridge,
+        &command_buffer,
+        &policy_action_buffer,
+        &observation_buffer);
 
     const int rc = controller.Run(&g_stop_requested);
     g_stop_requested.store(true, std::memory_order_release);
-    xr_source.Stop();
+    if (xr_source) {
+      xr_source->Stop();
+    }
+    if (policy_action_source) {
+      policy_action_source->Stop();
+    }
     if (observation_thread.joinable()) {
       observation_thread.join();
     }
@@ -311,7 +402,12 @@ int main(int argc, char** argv) {
   }
 
   g_stop_requested.store(true, std::memory_order_release);
-  xr_source.Stop();
+  if (xr_source) {
+    xr_source->Stop();
+  }
+  if (policy_action_source) {
+    policy_action_source->Stop();
+  }
   if (observation_thread.joinable()) {
     observation_thread.join();
   }

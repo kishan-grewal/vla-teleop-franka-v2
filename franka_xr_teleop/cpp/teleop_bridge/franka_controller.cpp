@@ -70,6 +70,22 @@ std::array<double, 7> ClampToJointLimits(const std::array<double, 7>& q) {
   return out;
 }
 
+Pose ApplyPolicyActionDelta(const Pose& current_pose, const TeleopAction& action) {
+  Pose desired = current_pose;
+  for (size_t i = 0; i < 3; ++i) {
+    desired.p[i] += action.delta_translation_m[i];
+  }
+
+  const Eigen::Vector3d rotation_delta = ToEigen(action.delta_rotation_rad);
+  const double rotation_norm = rotation_delta.norm();
+  if (rotation_norm > 1e-12 && std::isfinite(rotation_norm)) {
+    const Eigen::Vector3d axis = rotation_delta / rotation_norm;
+    const Eigen::Quaterniond q_step(Eigen::AngleAxisd(rotation_norm, axis));
+    desired.q = ToArrayQuat(q_step * ToEigenQuat(current_pose.q));
+  }
+  return desired;
+}
+
 void ConfigureConservativeBehavior(franka::Robot* robot) {
   robot->setCollisionBehavior(
       {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
@@ -550,6 +566,7 @@ class JointPositionTrajectoryGenerator {
 void PlannerLoop(const TeleopBridgeConfig& config,
                  const franka::Model& model,
                  const LatestCommandBuffer* command_buffer,
+                 const LatestPolicyActionBuffer* policy_action_buffer,
                  const LatestRobotStateBuffer* robot_state_buffer,
                  LatestPlannedTargetBuffer* planned_target_buffer,
                  TraceRecorder* trace_recorder,
@@ -585,22 +602,33 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       const uint64_t now_ns = MonotonicNowNs();
       const uint64_t loop_dt_ns = (planner_last_ns == 0) ? 0 : (now_ns - planner_last_ns);
       planner_last_ns = now_ns;
+      const bool policy_control = config.control_source == ControlSource::kPolicy;
       const XRCommand xr_cmd = command_buffer->ReadLatest();
+      const PolicyActionCommand policy_cmd =
+          policy_action_buffer != nullptr ? policy_action_buffer->ReadLatest() : PolicyActionCommand{};
       const RobotSnapshot robot = robot_state_buffer->ReadLatest();
+      const uint64_t input_timestamp_ns = policy_control ? policy_cmd.timestamp_ns : xr_cmd.timestamp_ns;
+      const uint64_t input_sequence_id = policy_control ? policy_cmd.sequence_id : xr_cmd.sequence_id;
 
       PlannedTarget planned{};
       planned.target_timestamp_ns = now_ns;
       planned.target_q = robot.q;
       planned.desired_tcp_pose = robot.tcp_pose;
       planned.control_mode = ControlMode::kHold;
-      const double gripper_trigger = Clamp01(xr_cmd.gripper_trigger_value);
+      const double policy_gripper_command = Clamp01(policy_cmd.action.gripper_command);
+      const double gripper_trigger =
+          policy_control ? policy_gripper_command : Clamp01(xr_cmd.gripper_trigger_value);
       const GripperState desired_state =
-          gripper_controller.UpdateDesiredState(config.gripper, gripper_trigger, now_ns);
-      const double gripper_command = desired_state == GripperState::kClose ? 1.0 : 0.0;
+          policy_control
+              ? (policy_gripper_command >= 0.5 ? GripperState::kClose : GripperState::kOpen)
+              : gripper_controller.UpdateDesiredState(config.gripper, gripper_trigger, now_ns);
+      const double gripper_command =
+          policy_control ? policy_gripper_command : (desired_state == GripperState::kClose ? 1.0 : 0.0);
       planned.target_gripper_width_m = MapStateToWidth(config.gripper, desired_state);
       planned.requested_action.gripper_command = gripper_command;
       desired_gripper_state->store(desired_state, std::memory_order_release);
-      const double control_value = Clamp01(xr_cmd.control_trigger_value);
+      const double control_value =
+          policy_control ? (policy_cmd.enabled ? 1.0 : 0.0) : Clamp01(xr_cmd.control_trigger_value);
 
       bool has_target = false;
       bool safe_target = false;
@@ -620,8 +648,8 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         PlannerTraceSample trace{};
         trace.timestamp_ns = now_ns;
         trace.loop_dt_ns = loop_dt_ns;
-        trace.xr_timestamp_ns = xr_cmd.timestamp_ns;
-        trace.xr_sequence_id = xr_cmd.sequence_id;
+        trace.xr_timestamp_ns = input_timestamp_ns;
+        trace.xr_sequence_id = input_sequence_id;
         trace.packet_age_ns = planned.packet_age_ns;
         trace.teleop_state = static_cast<int>(planned.teleop_state);
         trace.control_mode = static_cast<int>(planned.control_mode);
@@ -633,7 +661,7 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         trace.ik_ok = ik_ok;
         trace.faults = planned.faults;
         trace.control_trigger_value = control_value;
-        trace.xr_position = xr_cmd.right_controller_pose.p;
+        trace.xr_position = policy_control ? robot.tcp_pose.p : xr_cmd.right_controller_pose.p;
         trace.desired_position = desired_pose.p;
         trace.safe_position = safe_pose.p;
         trace.robot_position = robot.tcp_pose.p;
@@ -659,14 +687,21 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         continue;
       }
 
-      const uint64_t packet_age_ns = now_ns > xr_cmd.timestamp_ns ? (now_ns - xr_cmd.timestamp_ns) : 0;
+      const uint64_t packet_age_ns =
+          input_timestamp_ns != 0 && now_ns > input_timestamp_ns ? (now_ns - input_timestamp_ns)
+                                                                 : std::numeric_limits<uint64_t>::max();
       planned.packet_age_ns = packet_age_ns;
       const double packet_age_s = static_cast<double>(packet_age_ns) * 1e-9;
 
       StateInputs inputs{};
-      inputs.xr_stream_healthy = safety.IsStreamHealthy(packet_age_s);
+      inputs.xr_stream_healthy =
+          input_timestamp_ns != 0 &&
+          (policy_control ? packet_age_s <= config.policy.command_timeout_s
+                          : safety.IsStreamHealthy(packet_age_s));
       if (!inputs.xr_stream_healthy) {
         deadman_latched = false;
+      } else if (policy_control) {
+        deadman_latched = policy_cmd.enabled;
       } else if (deadman_latched) {
         if (control_value <= config.teleop.control_trigger_release_threshold) {
           deadman_latched = false;
@@ -674,12 +709,17 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       } else if (control_value >= config.teleop.control_trigger_threshold) {
         deadman_latched = true;
       }
-      if (inputs.xr_stream_healthy && xr_cmd.button_b && !last_button_b) {
+      const bool button_b = inputs.xr_stream_healthy ? xr_cmd.button_b : false;
+      if (policy_control) {
+        if (inputs.xr_stream_healthy && policy_cmd.episode_start) {
+          episode_start_marker_until_ns = now_ns + kEpisodeStartMarkerNs;
+        }
+      } else if (button_b && !last_button_b) {
         episode_start_marker_until_ns = now_ns + kEpisodeStartMarkerNs;
       }
       planned.episode_start =
           episode_start_marker_until_ns != 0 && now_ns <= episode_start_marker_until_ns;
-      last_button_b = inputs.xr_stream_healthy ? xr_cmd.button_b : false;
+      last_button_b = button_b;
       inputs.deadman_pressed = deadman_latched;
       inputs.robot_ok = robot.robot_ok;
       inputs.fault_requested = false;
@@ -703,12 +743,19 @@ void PlannerLoop(const TeleopBridgeConfig& config,
 
       planned.control_mode = config.teleop.control_mode;
       TeleopAction requested_action{};
-      has_target = mapper.ComputeTargetPose(robot.tcp_pose,
-                                            xr_cmd,
-                                            true,
-                                            planned.control_mode,
-                                            &desired_pose,
-                                            &requested_action);
+      if (policy_control) {
+        has_target = inputs.xr_stream_healthy && policy_cmd.enabled;
+        requested_action = policy_cmd.action;
+        requested_action.gripper_command = gripper_command;
+        desired_pose = ApplyPolicyActionDelta(robot.tcp_pose, requested_action);
+      } else {
+        has_target = mapper.ComputeTargetPose(robot.tcp_pose,
+                                              xr_cmd,
+                                              true,
+                                              planned.control_mode,
+                                              &desired_pose,
+                                              &requested_action);
+      }
       planned.requested_action = requested_action;
       planned.requested_action.gripper_command = gripper_command;
       if (!has_target) {
@@ -730,10 +777,32 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         continue;
       }
 
-      // Safety target shaping is intentionally bypassed in this simplified mode:
-      // planner uses mapper output directly for IK.
-      safe_target = true;
-      safe_pose = desired_pose;
+      if (policy_control) {
+        safe_target = safety.FilterTargetPose(robot.tcp_pose, desired_pose, 0.0, &planned.faults, &safe_pose);
+      } else {
+        // Safety target shaping is intentionally bypassed in this simplified mode:
+        // planner uses mapper output directly for IK.
+        safe_target = true;
+        safe_pose = desired_pose;
+      }
+      if (!safe_target) {
+        const bool can_reuse_target =
+            has_recent_target && now_ns > last_valid_target_ns &&
+            (now_ns - last_valid_target_ns) <= kPlannerTargetGraceNs;
+        if (can_reuse_target) {
+          planned.control_mode = last_valid_control_mode;
+          planned.target_q = last_valid_target_q;
+          planned.desired_tcp_pose = last_valid_desired_pose;
+          planned.manipulability = last_valid_manipulability;
+          planned.target_fresh = true;
+        } else {
+          planned.control_mode = ControlMode::kHold;
+        }
+        planned_target_buffer->Publish(planned);
+        publish_trace();
+        std::this_thread::sleep_for(sleep_period);
+        continue;
+      }
       planned.desired_tcp_pose = safe_pose;
 
       double manipulability = 0.0;
@@ -1012,10 +1081,12 @@ void GripperLoop(franka::Gripper* gripper,
 FrankaTeleopController::FrankaTeleopController(const FrankaControllerOptions& options,
                                                const TeleopBridgeConfig& config,
                                                const LatestCommandBuffer* command_buffer,
+                                               const LatestPolicyActionBuffer* policy_action_buffer,
                                                LatestObservationBuffer* observation_buffer)
     : options_(options),
       config_(config),
       command_buffer_(command_buffer),
+      policy_action_buffer_(policy_action_buffer),
       observation_buffer_(observation_buffer) {}
 
 int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
@@ -1136,6 +1207,7 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
                                  std::cref(config_),
                                  std::cref(model),
                                  command_buffer_,
+                                 policy_action_buffer_,
                                  &robot_state_buffer,
                                  &planned_target_buffer,
                                  trace_recorder.get(),

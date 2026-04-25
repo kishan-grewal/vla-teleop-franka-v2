@@ -103,6 +103,7 @@ add_executable(franka_xr_teleop_bridge
   main.cpp
   config_loader.cpp
   xrobotics_source.cpp
+  policy_action_source.cpp
   teleop_mapper.cpp
   teleop_state_machine.cpp
   gripper.cpp
