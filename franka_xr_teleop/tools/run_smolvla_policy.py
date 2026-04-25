@@ -103,6 +103,31 @@ def _ensure_lerobot_importable(lerobot_root: Path) -> None:
         sys.path.insert(0, str(lerobot_src))
 
 
+def _resolve_policy_path(path: Path) -> Path:
+    path = path.expanduser().resolve()
+    if (path / "config.json").exists():
+        return path
+
+    checkpoint_pretrained = path / "pretrained_model"
+    if (checkpoint_pretrained / "config.json").exists():
+        return checkpoint_pretrained
+
+    last_pretrained = path / "checkpoints" / "last" / "pretrained_model"
+    if (last_pretrained / "config.json").exists():
+        return last_pretrained
+
+    candidates = sorted((path / "checkpoints").glob("*/pretrained_model")) if (path / "checkpoints").exists() else []
+    candidates = [candidate for candidate in candidates if (candidate / "config.json").exists()]
+    if candidates:
+        return candidates[-1]
+
+    raise FileNotFoundError(
+        f"Could not find a loadable policy under {path}. "
+        "Pass either a pretrained_model directory or a training output directory "
+        "containing checkpoints/last/pretrained_model."
+    )
+
+
 def _robot_state_vector(obs: dict[str, Any]) -> np.ndarray:
     state = obs.get("robot_state", {})
     q = state.get("q", [])
@@ -208,7 +233,7 @@ def main() -> int:
             from lerobot.policies.utils import prepare_observation_for_inference
 
             device = torch.device(args.device)
-            policy_path = str(args.policy_path)
+            policy_path = str(_resolve_policy_path(args.policy_path))
             policy = SmolVLAPolicy.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
