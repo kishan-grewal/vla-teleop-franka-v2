@@ -160,6 +160,10 @@ In another terminal, run the policy sidecar:
   --task "your task instruction"
 ```
 
+`--policy-path` may point either at the SmolVLA training output directory
+(`outputs/<dataset>_smolvla`) or directly at a LeRobot checkpoint export such
+as `outputs/<dataset>_smolvla/checkpoints/last/pretrained_model`.
+
 For a bridge smoke test without loading a model or cameras:
 
 ```bash
