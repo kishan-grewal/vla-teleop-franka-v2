@@ -549,7 +549,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs-port", type=int, default=28081)
     parser.add_argument("--bridge-ip", default="127.0.0.1")
     parser.add_argument("--action-port", type=int, default=28082)
-    parser.add_argument("--rate-hz", type=float, default=10.0)
+    parser.add_argument("--rate-hz", type=float, default=30.0)
     parser.add_argument(
         "--top-camera-backend",
         choices=["realsense", "zed-left"],
