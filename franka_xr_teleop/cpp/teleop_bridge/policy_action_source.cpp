@@ -55,6 +55,13 @@ bool ParsePolicyAction(const std::string& payload,
   cmd.enabled = root.value("enabled", true);
   cmd.episode_start = root.value("episode_start", false);
   cmd.episode_end = root.value("episode_end", false);
+  if (root.contains("action_reference")) {
+    if (!root["action_reference"].is_string() ||
+        !ParsePolicyActionReference(root["action_reference"].get<std::string>(),
+                                    &cmd.action_reference)) {
+      return false;
+    }
+  }
 
   if (root.contains("action")) {
     const json& action = root["action"];

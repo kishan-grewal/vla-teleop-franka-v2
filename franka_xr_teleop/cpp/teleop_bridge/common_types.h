@@ -28,6 +28,13 @@ enum class ControlSource : uint8_t {
   kPolicy = 1,
 };
 
+enum class PolicyActionReference : uint8_t {
+  // Interpret policy action as a delta from the robot TCP pose at consumption time.
+  kCurrentPose = 0,
+  // Interpret policy action as a target offset from the rollout anchor pose.
+  kRolloutAnchor = 1,
+};
+
 enum class GripperCommandMode : uint8_t {
   kAnalog = 0,
   kBinary = 1,
@@ -90,6 +97,18 @@ inline bool ParseControlSource(std::string_view value, ControlSource* source) {
   return false;
 }
 
+inline bool ParsePolicyActionReference(std::string_view value, PolicyActionReference* reference) {
+  if (value == "current_pose" || value == "current_delta" || value == "current") {
+    *reference = PolicyActionReference::kCurrentPose;
+    return true;
+  }
+  if (value == "rollout_anchor" || value == "anchor_delta" || value == "anchor") {
+    *reference = PolicyActionReference::kRolloutAnchor;
+    return true;
+  }
+  return false;
+}
+
 inline bool ParseGripperCommandMode(std::string_view value, GripperCommandMode* mode) {
   if (value == "analog") {
     *mode = GripperCommandMode::kAnalog;
@@ -142,6 +161,7 @@ struct PolicyActionCommand {
   uint64_t timestamp_ns = 0;
   uint64_t sequence_id = 0;
   TeleopAction action{};
+  PolicyActionReference action_reference = PolicyActionReference::kCurrentPose;
   bool enabled = false;
   bool episode_start = false;
   bool episode_end = false;

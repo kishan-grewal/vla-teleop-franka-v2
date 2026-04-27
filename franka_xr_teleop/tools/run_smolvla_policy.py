@@ -28,6 +28,8 @@ EXPECTED_STATE_DIM = 8
 EXPECTED_ACTION_DIM = 7
 SUPPORTED_PYTHON_MIN = (3, 12)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
+DEFAULT_ACTION_REFERENCE = "anchor_delta"
+DEFAULT_POLICY_ANCHOR_RESET = "chunk"
 
 
 def _ensure_supported_python() -> None:
@@ -359,10 +361,41 @@ def _feature_image_shape(policy: Any, key: str, fallback_hw: tuple[int, int]) ->
     return fallback_hw
 
 
-def _clamp_action_with_info(
+def _load_action_stats(policy_path: Path) -> dict[str, Any] | None:
+    stats_path = policy_path / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+    if not stats_path.exists():
+        return None
+    try:
+        from safetensors.torch import load_file
+    except ImportError:
+        return None
+
+    tensors = load_file(str(stats_path))
+
+    def vec(name: str) -> list[float] | None:
+        tensor = tensors.get(f"action.{name}")
+        if tensor is None:
+            return None
+        return [float(v) for v in tensor.detach().cpu().reshape(-1).tolist()]
+
+    q01 = vec("q01")
+    q99 = vec("q99")
+    if q01 is None or q99 is None or len(q01) < 7 or len(q99) < 7:
+        return None
+    return {
+        "source": str(stats_path),
+        "q01": q01[:7],
+        "q99": q99[:7],
+        "translation_q99_norm_m": float(np.linalg.norm(q99[:3])),
+        "rotation_q99_norm_rad": float(np.linalg.norm(q99[3:6])),
+    }
+
+
+def _diagnose_action_with_info(
     action: np.ndarray,
-    max_translation_m: float,
-    max_rotation_rad: float,
+    action_stats: dict[str, Any] | None,
+    reject_translation_m: float,
+    reject_rotation_rad: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     action = np.asarray(action, dtype=np.float64).reshape(-1).copy()
     if action.shape[0] != 7:
@@ -373,46 +406,70 @@ def _clamp_action_with_info(
     raw_translation_norm = float(np.linalg.norm(action[:3]))
     raw_rotation_norm = float(np.linalg.norm(action[3:6]))
     raw_gripper = float(action[6])
-    translation_clamped = False
-    rotation_clamped = False
     gripper_clipped = not 0.0 <= raw_gripper <= 1.0
 
-    t_norm = float(np.linalg.norm(action[:3]))
-    if max_translation_m > 0 and t_norm > max_translation_m:
-        action[:3] *= max_translation_m / max(t_norm, 1e-12)
-        translation_clamped = True
-    r_norm = float(np.linalg.norm(action[3:6]))
-    if max_rotation_rad > 0 and r_norm > max_rotation_rad:
-        action[3:6] *= max_rotation_rad / max(r_norm, 1e-12)
-        rotation_clamped = True
+    if reject_translation_m > 0 and raw_translation_norm > reject_translation_m:
+        raise ValueError(
+            f"Policy translation norm {raw_translation_norm:.6f} m exceeds "
+            f"--reject-translation-m={reject_translation_m:.6f}"
+        )
+    if reject_rotation_rad > 0 and raw_rotation_norm > reject_rotation_rad:
+        raise ValueError(
+            f"Policy rotation norm {raw_rotation_norm:.6f} rad exceeds "
+            f"--reject-rotation-rad={reject_rotation_rad:.6f}"
+        )
+
     action[6] = float(np.clip(action[6], 0.0, 1.0))
+    outside_q01_q99: list[int] = []
+    training_translation_q99_norm_m: float | None = None
+    training_rotation_q99_norm_rad: float | None = None
+    translation_above_training_q99_norm = False
+    rotation_above_training_q99_norm = False
+    if action_stats is not None:
+        q01 = action_stats["q01"]
+        q99 = action_stats["q99"]
+        outside_q01_q99 = [
+            idx for idx, value in enumerate(np.asarray(action, dtype=np.float64).reshape(-1))
+            if idx < len(q01) and (float(value) < float(q01[idx]) or float(value) > float(q99[idx]))
+        ]
+        training_translation_q99_norm_m = float(action_stats["translation_q99_norm_m"])
+        training_rotation_q99_norm_rad = float(action_stats["rotation_q99_norm_rad"])
+        translation_above_training_q99_norm = raw_translation_norm > training_translation_q99_norm_m
+        rotation_above_training_q99_norm = raw_rotation_norm > training_rotation_q99_norm_rad
+
     return action, {
         "raw_translation_norm_m": raw_translation_norm,
         "raw_rotation_norm_rad": raw_rotation_norm,
         "raw_gripper": raw_gripper,
-        "clamped_translation_norm_m": float(np.linalg.norm(action[:3])),
-        "clamped_rotation_norm_rad": float(np.linalg.norm(action[3:6])),
-        "clamped_gripper": float(action[6]),
-        "translation_clamped": translation_clamped,
-        "rotation_clamped": rotation_clamped,
+        "sent_translation_norm_m": float(np.linalg.norm(action[:3])),
+        "sent_rotation_norm_rad": float(np.linalg.norm(action[3:6])),
+        "sent_gripper": float(action[6]),
+        "outside_training_q01_q99_indices": outside_q01_q99,
+        "training_translation_q99_norm_m": training_translation_q99_norm_m,
+        "training_rotation_q99_norm_rad": training_rotation_q99_norm_rad,
+        "translation_above_training_q99_norm": translation_above_training_q99_norm,
+        "rotation_above_training_q99_norm": rotation_above_training_q99_norm,
+        "translation_rejected": False,
+        "rotation_rejected": False,
         "gripper_clipped": gripper_clipped,
     }
-
-
-def _clamp_action(action: np.ndarray, max_translation_m: float, max_rotation_rad: float) -> np.ndarray:
-    action, _info = _clamp_action_with_info(action, max_translation_m, max_rotation_rad)
-    return action
 
 
 def _send_action(sock: socket.socket,
                  dst: tuple[str, int],
                  sequence_id: int,
                  action: np.ndarray,
-                 enabled: bool) -> None:
+                 enabled: bool,
+                 action_reference: str,
+                 episode_start: bool = False,
+                 episode_end: bool = False) -> None:
     message = {
         "timestamp_ns": time.monotonic_ns(),
         "sequence_id": sequence_id,
         "enabled": enabled,
+        "action_reference": action_reference,
+        "episode_start": episode_start,
+        "episode_end": episode_end,
         "action": [float(v) for v in action],
     }
     sock.sendto(json.dumps(message, separators=(",", ":")).encode("utf-8"), dst)
@@ -427,6 +484,22 @@ def _write_jsonl(handle: TextIO | None, row: dict[str, Any]) -> None:
 
 def _jsonable_action(action: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
+
+
+def _policy_will_start_action_chunk(policy: Any) -> bool:
+    checker = getattr(policy, "_check_get_actions_condition", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+
+    queues = getattr(policy, "_queues", None)
+    if isinstance(queues, dict):
+        action_queue = queues.get(ACTION_KEY)
+        if action_queue is not None:
+            return len(action_queue) == 0
+    return False
 
 
 def _timestamped_preview_dir(root: Path) -> Path:
@@ -605,10 +678,40 @@ def parse_args() -> argparse.Namespace:
         "--log-actions-jsonl",
         type=Path,
         default=None,
-        help="Optional JSONL path for raw/clamped policy actions and clamp metadata.",
+        help="Optional JSONL path for raw/sent policy actions and action-distribution diagnostics.",
     )
-    parser.add_argument("--max-translation-m", type=float, default=0.015)
-    parser.add_argument("--max-rotation-rad", type=float, default=0.10)
+    parser.add_argument(
+        "--policy-action-reference",
+        choices=["anchor_delta", "current_delta"],
+        default=DEFAULT_ACTION_REFERENCE,
+        help=(
+            "How the bridge should interpret the policy action. "
+            "anchor_delta matches teleop training data: action is an offset from "
+            "the rollout anchor pose set by episode_start."
+        ),
+    )
+    parser.add_argument(
+        "--policy-anchor-reset",
+        choices=["chunk", "run"],
+        default=DEFAULT_POLICY_ANCHOR_RESET,
+        help=(
+            "Only used with --policy-action-reference=anchor_delta. "
+            "chunk resets the bridge anchor whenever SmolVLA starts a new action chunk; "
+            "run keeps one anchor for the whole policy process."
+        ),
+    )
+    parser.add_argument(
+        "--reject-translation-m",
+        type=float,
+        default=2.0,
+        help="Reject policy actions above this translation norm. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--reject-rotation-rad",
+        type=float,
+        default=3.1416,
+        help="Reject policy actions above this rotation-vector norm. Set <=0 to disable.",
+    )
     parser.add_argument(
         "--zero-actions",
         action="store_true",
@@ -644,6 +747,7 @@ def main() -> int:
     postprocess = None
     top_camera = None
     third_person_camera = None
+    action_stats: dict[str, Any] | None = None
     action_log: TextIO | None = None
 
     try:
@@ -659,10 +763,13 @@ def main() -> int:
             from lerobot.policies.utils import prepare_observation_for_inference
 
             device = torch.device(args.device)
-            policy_path = str(_resolve_policy_path(args.policy_path))
+            policy_path_obj = _resolve_policy_path(args.policy_path)
+            policy_path = str(policy_path_obj)
+            action_stats = _load_action_stats(policy_path_obj)
             policy = SmolVLAPolicy.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
+            policy.reset()
             image_keys = (TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
             policy_features = _validate_policy_features(policy, image_keys, args.print_policy_features)
             preprocess, postprocess = make_pre_post_processors(
@@ -725,6 +832,15 @@ def main() -> int:
                 )
                 print(f"Saved camera preview manifest to {manifest_path}", flush=True)
             print(f"Loaded SmolVLA policy from {policy_path}", flush=True)
+            if action_stats is not None:
+                print(
+                    "Action diagnostics loaded: "
+                    f"translation_q99_norm={action_stats['translation_q99_norm_m']:.6f}m, "
+                    f"rotation_q99_norm={action_stats['rotation_q99_norm_rad']:.6f}rad",
+                    flush=True,
+                )
+            else:
+                print("Action diagnostics unavailable: policy action quantiles not found.", flush=True)
         else:
             torch = None
             prepare_observation_for_inference = None
@@ -733,11 +849,14 @@ def main() -> int:
 
         print(
             f"Streaming policy actions to udp://{args.bridge_ip}:{args.action_port} "
-            f"from observations udp://{args.obs_bind_ip}:{args.obs_port}",
+            f"from observations udp://{args.obs_bind_ip}:{args.obs_port} "
+            f"at {args.rate_hz:.2f} Hz action_reference={args.policy_action_reference} "
+            f"anchor_reset={args.policy_anchor_reset}",
             flush=True,
         )
 
         sequence_id = 0
+        sent_episode_start = False
         while True:
             start = time.monotonic()
             obs = obs_rx.latest()
@@ -746,6 +865,7 @@ def main() -> int:
                 continue
 
             sequence_id += 1
+            policy_chunk_start = False
             if args.zero_actions:
                 raw_action = np.zeros(7, dtype=np.float64)
             else:
@@ -768,25 +888,49 @@ def main() -> int:
                     task=args.task,
                     robot_type=args.robot_type,
                 )
+                policy_chunk_start = _policy_will_start_action_chunk(policy)
                 with torch.inference_mode():
                     action_tensor = policy.select_action(preprocess(frame))
                     action_tensor = postprocess(action_tensor)
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
 
-            action, clamp_info = _clamp_action_with_info(raw_action, args.max_translation_m, args.max_rotation_rad)
+            action, action_info = _diagnose_action_with_info(
+                raw_action,
+                action_stats,
+                args.reject_translation_m,
+                args.reject_rotation_rad,
+            )
+            episode_start = not sent_episode_start or (
+                args.policy_action_reference == "anchor_delta"
+                and args.policy_anchor_reset == "chunk"
+                and policy_chunk_start
+            )
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
                 "source": "zero_actions" if args.zero_actions else "policy",
                 "task": args.task,
+                "action_reference": args.policy_action_reference,
+                "anchor_reset": args.policy_anchor_reset,
+                "policy_chunk_start": policy_chunk_start,
+                "episode_start": episode_start,
                 "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
                 "raw_action": _jsonable_action(raw_action),
-                "clamped_action": _jsonable_action(action),
-                "max_translation_m": args.max_translation_m,
-                "max_rotation_rad": args.max_rotation_rad,
-                **clamp_info,
+                "sent_action": _jsonable_action(action),
+                "reject_translation_m": args.reject_translation_m,
+                "reject_rotation_rad": args.reject_rotation_rad,
+                **action_info,
             })
-            _send_action(action_sock, dst, sequence_id, action, enabled=True)
+            _send_action(
+                action_sock,
+                dst,
+                sequence_id,
+                action,
+                enabled=True,
+                action_reference=args.policy_action_reference,
+                episode_start=episode_start,
+            )
+            sent_episode_start = True
 
             elapsed = time.monotonic() - start
             if elapsed < period_s:

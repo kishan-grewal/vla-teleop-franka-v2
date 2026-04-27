@@ -598,6 +598,9 @@ void PlannerLoop(const TeleopBridgeConfig& config,
     bool last_button_b = false;
     uint64_t episode_start_marker_until_ns = 0;
     uint64_t episode_end_marker_until_ns = 0;
+    Pose policy_rollout_anchor_pose{};
+    bool policy_rollout_anchor_initialized = false;
+    uint64_t last_policy_anchor_sequence_id = 0;
     bool has_recent_target = false;
     uint64_t last_valid_target_ns = 0;
     std::array<double, 7> last_valid_target_q{};
@@ -724,9 +727,15 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       if (policy_control) {
         if (inputs.xr_stream_healthy && policy_cmd.episode_start) {
           episode_start_marker_until_ns = now_ns + kEpisodeMarkerNs;
+          if (policy_cmd.sequence_id != last_policy_anchor_sequence_id) {
+            policy_rollout_anchor_pose = robot.tcp_pose;
+            policy_rollout_anchor_initialized = true;
+            last_policy_anchor_sequence_id = policy_cmd.sequence_id;
+          }
         }
         if (inputs.xr_stream_healthy && policy_cmd.episode_end) {
           episode_end_marker_until_ns = now_ns + kEpisodeMarkerNs;
+          policy_rollout_anchor_initialized = false;
         }
       } else if (use_a_button_for_episode_markers) {
         if (button_a && !last_button_a) {
@@ -755,6 +764,9 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       if (!inputs.xr_stream_healthy) {
         planned.faults.packet_timeout = true;
       }
+      if (policy_control && (!inputs.xr_stream_healthy || !policy_cmd.enabled)) {
+        policy_rollout_anchor_initialized = false;
+      }
 
       if (!planned.teleop_active) {
         if (last_valid_target_ns != 0) {
@@ -778,7 +790,16 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         has_target = inputs.xr_stream_healthy && policy_cmd.enabled;
         requested_action = policy_cmd.action;
         requested_action.gripper_command = gripper_command;
-        desired_pose = ApplyPolicyActionDelta(robot.tcp_pose, requested_action);
+        if (policy_cmd.action_reference == PolicyActionReference::kRolloutAnchor) {
+          if (!policy_rollout_anchor_initialized) {
+            policy_rollout_anchor_pose = robot.tcp_pose;
+            policy_rollout_anchor_initialized = true;
+            last_policy_anchor_sequence_id = policy_cmd.sequence_id;
+          }
+          desired_pose = ApplyPolicyActionDelta(policy_rollout_anchor_pose, requested_action);
+        } else {
+          desired_pose = ApplyPolicyActionDelta(robot.tcp_pose, requested_action);
+        }
       } else {
         has_target = mapper.ComputeTargetPose(robot.tcp_pose,
                                               xr_cmd,
