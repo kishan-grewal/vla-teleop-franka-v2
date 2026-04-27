@@ -267,6 +267,9 @@ struct GripperConfig {
 struct IkConfig {
   double damping = 0.05;
   double nullspace_gain = 0.15;
+  std::array<double, 7> nullspace_joint_positions_rad{
+      {0.0, -0.7853981633974483, 0.0, -2.356194490192345, 0.0, 1.5707963267948966, 0.7853981633974483}};
+  uint32_t planner_substeps = 1;
   double max_joint_velocity_radps = 0.35;
   double max_joint_acceleration_radps2 = 1.5;
   double max_joint_jerk_radps3 = 12.0;

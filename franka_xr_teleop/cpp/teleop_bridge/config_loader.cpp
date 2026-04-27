@@ -145,6 +145,10 @@ bool LoadTeleopConfig(const std::string& path, AppConfig* config, std::string* e
   if (const YAML::Node ik = teleop["ik"]; ik && ik.IsMap()) {
     ReadScalar(ik, "damping", &config->bridge.ik.damping);
     ReadScalar(ik, "nullspace_gain", &config->bridge.ik.nullspace_gain);
+    ReadArray(ik,
+              "nullspace_joint_positions_rad",
+              &config->bridge.ik.nullspace_joint_positions_rad);
+    ReadScalar(ik, "planner_substeps", &config->bridge.ik.planner_substeps);
     ReadScalar(ik, "max_joint_velocity_radps", &config->bridge.ik.max_joint_velocity_radps);
     ReadScalar(ik, "max_joint_acceleration_radps2", &config->bridge.ik.max_joint_acceleration_radps2);
     ReadScalar(ik, "max_joint_jerk_radps3", &config->bridge.ik.max_joint_jerk_radps3);
