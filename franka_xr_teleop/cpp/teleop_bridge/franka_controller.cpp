@@ -270,8 +270,8 @@ bool SolveIkStep(const franka::Model& model,
   // tracking, instead of re-seeding from measured joint motion every planner tick.
   std::array<double, 7> q_next = snapshot.q_d;
   Pose tcp_pose_next = snapshot.tcp_pose_d;
-  const Eigen::Matrix<double, 7, 1> q_home =
-      Eigen::Map<const Eigen::Matrix<double, 7, 1>>(config.teleop.start_joint_positions_rad.data());
+  const Eigen::Matrix<double, 7, 1> q_nullspace_target = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(
+    config.ik.nullspace_joint_positions_rad.data());
   const double dt = 1.0 / config.teleop.planner_rate_hz;
   const double max_step_by_velocity = config.ik.max_joint_velocity_radps * dt;
   const double max_step = std::min(config.ik.max_joint_step_rad, max_step_by_velocity);
@@ -322,7 +322,7 @@ bool SolveIkStep(const franka::Model& model,
         Eigen::Matrix<double, 7, 7>::Identity() -
         jacobian_task.transpose() * a_ldlt.solve(jacobian_task);
     const Eigen::Matrix<double, 7, 1> dq =
-        dq_primary + config.ik.nullspace_gain * nullspace_projector * (q_home - q_current);
+        dq_primary + config.ik.nullspace_gain * nullspace_projector * (q_nullspace_target - q_current);
 
     for (size_t i = 0; i < 7; ++i) {
       if (!std::isfinite(dq[i])) {

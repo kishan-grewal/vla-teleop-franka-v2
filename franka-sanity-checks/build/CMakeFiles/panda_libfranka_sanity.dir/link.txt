@@ -1,1 +1,1 @@
-/usr/bin/c++  -O3 -DNDEBUG   CMakeFiles/panda_libfranka_sanity.dir/src/main.cpp.o  -o panda_libfranka_sanity  -Wl,-rpath,/usr/local/lib /usr/local/lib/libfranka.so.0.9.2 
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/panda_libfranka_sanity.dir/src/main.cpp.o -o panda_libfranka_sanity  -Wl,-rpath,/usr/local/lib /usr/local/lib/libfranka.so.0.9.2

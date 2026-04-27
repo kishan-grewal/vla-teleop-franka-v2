@@ -1,3 +1,3 @@
-/home/radu/vla-teleop-franka-v2/build/CMakeFiles/rebuild_cache.dir
-/home/radu/vla-teleop-franka-v2/build/CMakeFiles/edit_cache.dir
-/home/radu/vla-teleop-franka-v2/build/CMakeFiles/panda_libfranka_sanity.dir
+/home/radu/vla-teleop-franka-v2-model-deploy/franka-sanity-checks/build/CMakeFiles/panda_libfranka_sanity.dir
+/home/radu/vla-teleop-franka-v2-model-deploy/franka-sanity-checks/build/CMakeFiles/edit_cache.dir
+/home/radu/vla-teleop-franka-v2-model-deploy/franka-sanity-checks/build/CMakeFiles/rebuild_cache.dir

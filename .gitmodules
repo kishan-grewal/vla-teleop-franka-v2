@@ -17,3 +17,6 @@
 [submodule "franka_xr_teleop/third_party/XRoboToolkit-Unity-Client-Quest"]
 	path = franka_xr_teleop/third_party/XRoboToolkit-Unity-Client-Quest
 	url = https://github.com/XR-Robotics/XRoboToolkit-Unity-Client-Quest.git
+[submodule "lerobot"]
+	path = lerobot
+	url = https://github.com/huggingface/lerobot.git

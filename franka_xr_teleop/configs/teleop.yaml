@@ -26,7 +26,8 @@ teleop:
     command_timeout_s: 0.20
   ik:
     damping: 0.08
-    nullspace_gain: 0.0
+    nullspace_gain: 0.15
+    nullspace_joint_positions_rad: [0, -0.795, 0, -2.356, 0, 1.571, 0.785]
     planner_substeps: 8
     max_joint_velocity_radps: 1.5
     max_joint_acceleration_radps2: 6.0
