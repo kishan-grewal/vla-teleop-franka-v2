@@ -9,10 +9,20 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import numpy as np
+
+
+OBS_STATE_KEY = "observation.state"
+TOP_IMAGE_KEY = "observation.images.top"
+THIRD_PERSON_IMAGE_KEY = "observation.images.third_person_d405"
+ACTION_KEY = "action"
+LIVE_INPUT_KEYS = (OBS_STATE_KEY, TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
+EXPECTED_STATE_DIM = 8
+EXPECTED_ACTION_DIM = 7
 
 
 class LatestRobotObservation:
@@ -58,6 +68,7 @@ class OpenCVCamera:
         import cv2
 
         self._cv2 = cv2
+        self.source = source
         self._cap = cv2.VideoCapture(_parse_camera_source(source))
         if not self._cap.isOpened():
             raise RuntimeError(f"Failed to open camera source {source!r}")
@@ -65,6 +76,7 @@ class OpenCVCamera:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         if height:
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def read_rgb(self, target_hw: tuple[int, int] | None = None) -> np.ndarray:
         ok, bgr = self._cap.read()
@@ -78,6 +90,18 @@ class OpenCVCamera:
 
     def close(self) -> None:
         self._cap.release()
+
+    def properties(self) -> dict[str, Any]:
+        fourcc = int(self._cap.get(self._cv2.CAP_PROP_FOURCC))
+        fourcc_text = "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00")
+        return {
+            "source": self.source,
+            "backend": self._cap.getBackendName() if hasattr(self._cap, "getBackendName") else None,
+            "reported_width": float(self._cap.get(self._cv2.CAP_PROP_FRAME_WIDTH)),
+            "reported_height": float(self._cap.get(self._cv2.CAP_PROP_FRAME_HEIGHT)),
+            "reported_fps": float(self._cap.get(self._cv2.CAP_PROP_FPS)),
+            "fourcc": fourcc_text,
+        }
 
 
 def _parse_camera_source(value: str) -> int | str:
@@ -137,27 +161,145 @@ def _robot_state_vector(obs: dict[str, Any]) -> np.ndarray:
     return np.asarray([*map(float, q), gripper_width], dtype=np.float32)
 
 
-def _feature_image_shape(policy: Any, key: str, fallback_hw: tuple[int, int]) -> tuple[int, int]:
-    feature = policy.config.input_features.get(key)
+def _feature_shape(feature: Any) -> tuple[int, ...] | None:
     shape = getattr(feature, "shape", None)
     if shape is None and isinstance(feature, dict):
         shape = feature.get("shape")
+    if shape is None:
+        return None
+    return tuple(int(v) for v in shape)
+
+
+def _feature_type(feature: Any) -> str | None:
+    feature_type = getattr(feature, "type", None)
+    if feature_type is None and isinstance(feature, dict):
+        feature_type = feature.get("type")
+    if feature_type is None:
+        return None
+    return getattr(feature_type, "value", str(feature_type))
+
+
+def _feature_summary(features: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    return {
+        key: {
+            "type": _feature_type(feature),
+            "shape": list(_feature_shape(feature) or []),
+        }
+        for key, feature in sorted((features or {}).items())
+    }
+
+
+def _validate_policy_features(policy: Any, print_full: bool = False) -> dict[str, Any]:
+    input_features = policy.config.input_features or {}
+    output_features = policy.config.output_features or {}
+    image_features = getattr(policy.config, "image_features", {}) or {}
+    errors: list[str] = []
+
+    state_shape = _feature_shape(input_features.get(OBS_STATE_KEY))
+    if OBS_STATE_KEY not in input_features:
+        errors.append(f"missing required input feature {OBS_STATE_KEY!r}")
+    elif state_shape != (EXPECTED_STATE_DIM,):
+        errors.append(
+            f"{OBS_STATE_KEY!r} must have shape [{EXPECTED_STATE_DIM}], got {list(state_shape or [])}"
+        )
+
+    for key in (TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY):
+        image_shape = _feature_shape(input_features.get(key))
+        if key not in input_features:
+            errors.append(f"missing required image feature {key!r}")
+            continue
+        if image_shape is None or len(image_shape) != 3:
+            errors.append(f"{key!r} must have image shape [C,H,W], got {list(image_shape or [])}")
+        elif image_shape[0] != 3:
+            errors.append(f"{key!r} must have 3 color channels, got shape {list(image_shape)}")
+
+    action_shape = _feature_shape(output_features.get(ACTION_KEY))
+    if ACTION_KEY not in output_features:
+        errors.append(f"missing required output feature {ACTION_KEY!r}")
+    elif action_shape != (EXPECTED_ACTION_DIM,):
+        errors.append(f"{ACTION_KEY!r} must have shape [{EXPECTED_ACTION_DIM}], got {list(action_shape or [])}")
+
+    supplied_live_keys = set(LIVE_INPUT_KEYS)
+    missing_live_image_keys = [
+        key for key in image_features
+        if key not in supplied_live_keys and not key.startswith("observation.images.empty_camera")
+    ]
+    if missing_live_image_keys:
+        errors.append(
+            "policy expects image feature(s) that this runner does not supply: "
+            + ", ".join(repr(key) for key in missing_live_image_keys)
+        )
+
+    summary = {
+        "input_features": _feature_summary(input_features),
+        "output_features": _feature_summary(output_features),
+        "live_observation_keys": list(LIVE_INPUT_KEYS),
+        "expected_state_dim": EXPECTED_STATE_DIM,
+        "expected_action_dim": EXPECTED_ACTION_DIM,
+        "image_features": sorted(image_features),
+    }
+
+    print("Policy feature compatibility:", flush=True)
+    for key in LIVE_INPUT_KEYS:
+        print(f"  live {key}: policy shape={summary['input_features'].get(key, {}).get('shape')}", flush=True)
+    print(f"  live {ACTION_KEY}: policy shape={summary['output_features'].get(ACTION_KEY, {}).get('shape')}", flush=True)
+    if print_full:
+        print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    if errors:
+        raise ValueError("Policy feature compatibility check failed:\n- " + "\n- ".join(errors))
+    return summary
+
+
+def _feature_image_shape(policy: Any, key: str, fallback_hw: tuple[int, int]) -> tuple[int, int]:
+    feature = policy.config.input_features.get(key)
+    shape = _feature_shape(feature)
     if shape and len(shape) == 3:
         return int(shape[1]), int(shape[2])
     return fallback_hw
 
 
-def _clamp_action(action: np.ndarray, max_translation_m: float, max_rotation_rad: float) -> np.ndarray:
-    action = np.asarray(action, dtype=np.float64).reshape(-1)
+def _clamp_action_with_info(
+    action: np.ndarray,
+    max_translation_m: float,
+    max_rotation_rad: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    action = np.asarray(action, dtype=np.float64).reshape(-1).copy()
     if action.shape[0] != 7:
         raise ValueError(f"Expected 7D action, got shape {action.shape}")
+    if not np.isfinite(action).all():
+        raise ValueError(f"Policy action contains non-finite values: {action.tolist()}")
+
+    raw_translation_norm = float(np.linalg.norm(action[:3]))
+    raw_rotation_norm = float(np.linalg.norm(action[3:6]))
+    raw_gripper = float(action[6])
+    translation_clamped = False
+    rotation_clamped = False
+    gripper_clipped = not 0.0 <= raw_gripper <= 1.0
+
     t_norm = float(np.linalg.norm(action[:3]))
     if max_translation_m > 0 and t_norm > max_translation_m:
         action[:3] *= max_translation_m / max(t_norm, 1e-12)
+        translation_clamped = True
     r_norm = float(np.linalg.norm(action[3:6]))
     if max_rotation_rad > 0 and r_norm > max_rotation_rad:
         action[3:6] *= max_rotation_rad / max(r_norm, 1e-12)
+        rotation_clamped = True
     action[6] = float(np.clip(action[6], 0.0, 1.0))
+    return action, {
+        "raw_translation_norm_m": raw_translation_norm,
+        "raw_rotation_norm_rad": raw_rotation_norm,
+        "raw_gripper": raw_gripper,
+        "clamped_translation_norm_m": float(np.linalg.norm(action[:3])),
+        "clamped_rotation_norm_rad": float(np.linalg.norm(action[3:6])),
+        "clamped_gripper": float(action[6]),
+        "translation_clamped": translation_clamped,
+        "rotation_clamped": rotation_clamped,
+        "gripper_clipped": gripper_clipped,
+    }
+
+
+def _clamp_action(action: np.ndarray, max_translation_m: float, max_rotation_rad: float) -> np.ndarray:
+    action, _info = _clamp_action_with_info(action, max_translation_m, max_rotation_rad)
     return action
 
 
@@ -173,6 +315,91 @@ def _send_action(sock: socket.socket,
         "action": [float(v) for v in action],
     }
     sock.sendto(json.dumps(message, separators=(",", ":")).encode("utf-8"), dst)
+
+
+def _write_jsonl(handle: TextIO | None, row: dict[str, Any]) -> None:
+    if handle is None:
+        return
+    handle.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
+    handle.flush()
+
+
+def _jsonable_action(action: np.ndarray) -> list[float]:
+    return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
+
+
+def _timestamped_preview_dir(root: Path) -> Path:
+    return root.expanduser() / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _save_preview_frame(path: Path, image_rgb: np.ndarray, label: str) -> None:
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    cv2.rectangle(bgr, (12, 12), (min(bgr.shape[1] - 1, 620), 58), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        bgr,
+        label,
+        (24, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    if not cv2.imwrite(str(path), bgr):
+        raise RuntimeError(f"Failed to save preview frame to {path}")
+
+
+def _capture_startup_preview(
+    camera: OpenCVCamera,
+    policy_key: str,
+    target_hw: tuple[int, int],
+    sample_count: int,
+    output_dir: Path | None,
+) -> dict[str, Any]:
+    sample_count = max(1, sample_count)
+    start = time.monotonic()
+    image = None
+    for _ in range(sample_count):
+        image = camera.read_rgb(target_hw)
+    elapsed_s = max(time.monotonic() - start, 1e-9)
+    assert image is not None
+
+    preview_path: str | None = None
+    if output_dir is not None:
+        safe_key = policy_key.replace(".", "_")
+        path = output_dir / f"{safe_key}.png"
+        _save_preview_frame(path, image, f"{policy_key} source={camera.source}")
+        preview_path = str(path)
+
+    props = camera.properties()
+    return {
+        **props,
+        "policy_key": policy_key,
+        "target_height": int(target_hw[0]),
+        "target_width": int(target_hw[1]),
+        "observed_height": int(image.shape[0]),
+        "observed_width": int(image.shape[1]),
+        "observed_channels": int(image.shape[2]) if image.ndim == 3 else 1,
+        "read_samples": sample_count,
+        "observed_read_fps": sample_count / elapsed_s,
+        "preview_path": preview_path,
+    }
+
+
+def _print_camera_summary(summary: dict[str, Any]) -> None:
+    print(
+        "Camera identity: "
+        f"{summary['policy_key']} <- source={summary['source']!r}, "
+        f"reported={summary['reported_width']:.0f}x{summary['reported_height']:.0f}@"
+        f"{summary['reported_fps']:.2f}fps, "
+        f"observed={summary['observed_width']}x{summary['observed_height']}, "
+        f"read_fps={summary['observed_read_fps']:.2f}, "
+        f"preview={summary['preview_path']}",
+        flush=True,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -195,6 +422,39 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
+    parser.add_argument(
+        "--allow-default-camera-indices",
+        action="store_true",
+        help="Allow unsafe default OpenCV camera indices 0/1. Prefer explicit device paths or serial-backed sources.",
+    )
+    parser.add_argument(
+        "--preview-dir",
+        type=Path,
+        default=Path("policy_previews"),
+        help="Directory where startup camera identity previews are saved.",
+    )
+    parser.add_argument(
+        "--skip-preview-frames",
+        action="store_true",
+        help="Do not save labelled startup preview frames.",
+    )
+    parser.add_argument(
+        "--camera-preview-samples",
+        type=int,
+        default=5,
+        help="Number of startup frames to read from each camera while estimating read FPS.",
+    )
+    parser.add_argument(
+        "--print-policy-features",
+        action="store_true",
+        help="Print the full policy feature summary in addition to the compact compatibility check.",
+    )
+    parser.add_argument(
+        "--log-actions-jsonl",
+        type=Path,
+        default=None,
+        help="Optional JSONL path for raw/clamped policy actions and clamp metadata.",
+    )
     parser.add_argument("--max-translation-m", type=float, default=0.015)
     parser.add_argument("--max-rotation-rad", type=float, default=0.10)
     parser.add_argument(
@@ -211,6 +471,15 @@ def main() -> int:
         raise ValueError("--rate-hz must be > 0")
     if not args.zero_actions and args.policy_path is None:
         raise ValueError("--policy-path is required unless --zero-actions is set")
+    if not args.zero_actions and not args.allow_default_camera_indices:
+        if args.top_camera == "0" and args.third_person_camera == "1":
+            raise ValueError(
+                "Default OpenCV camera indices are unsafe for policy deployment. "
+                "Pass explicit --top-camera/--third-person-camera sources, or add "
+                "--allow-default-camera-indices after verifying the startup preview frames."
+            )
+    if args.camera_preview_samples <= 0:
+        raise ValueError("--camera-preview-samples must be > 0")
 
     obs_rx = LatestRobotObservation(args.obs_bind_ip, args.obs_port)
     obs_rx.start()
@@ -223,8 +492,13 @@ def main() -> int:
     postprocess = None
     top_camera = None
     third_person_camera = None
+    action_log: TextIO | None = None
 
     try:
+        if args.log_actions_jsonl is not None:
+            args.log_actions_jsonl.expanduser().parent.mkdir(parents=True, exist_ok=True)
+            action_log = args.log_actions_jsonl.expanduser().open("a", buffering=1)
+
         if not args.zero_actions:
             _ensure_lerobot_importable(_resolve_lerobot_root(args.lerobot_root))
             import torch
@@ -237,15 +511,16 @@ def main() -> int:
             policy = SmolVLAPolicy.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
+            policy_features = _validate_policy_features(policy, args.print_policy_features)
             preprocess, postprocess = make_pre_post_processors(
                 policy.config,
                 policy_path,
                 preprocessor_overrides={"device_processor": {"device": str(device)}},
             )
-            top_hw = _feature_image_shape(policy, "observation.images.top", (args.camera_height, args.camera_width))
+            top_hw = _feature_image_shape(policy, TOP_IMAGE_KEY, (args.camera_height, args.camera_width))
             third_hw = _feature_image_shape(
                 policy,
-                "observation.images.third_person_d405",
+                THIRD_PERSON_IMAGE_KEY,
                 (args.camera_height, args.camera_width),
             )
             top_camera = OpenCVCamera(args.top_camera, args.camera_width, args.camera_height)
@@ -254,6 +529,40 @@ def main() -> int:
                 args.camera_width,
                 args.camera_height,
             )
+            preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
+            top_preview = _capture_startup_preview(
+                top_camera,
+                TOP_IMAGE_KEY,
+                top_hw,
+                args.camera_preview_samples,
+                preview_dir,
+            )
+            third_preview = _capture_startup_preview(
+                third_person_camera,
+                THIRD_PERSON_IMAGE_KEY,
+                third_hw,
+                args.camera_preview_samples,
+                preview_dir,
+            )
+            _print_camera_summary(top_preview)
+            _print_camera_summary(third_preview)
+            if preview_dir is not None:
+                manifest_path = preview_dir / "manifest.json"
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "policy_path": policy_path,
+                            "task": args.task,
+                            "policy_features": policy_features,
+                            "cameras": [top_preview, third_preview],
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                print(f"Saved camera preview manifest to {manifest_path}", flush=True)
             print(f"Loaded SmolVLA policy from {policy_path}", flush=True)
         else:
             torch = None
@@ -277,7 +586,7 @@ def main() -> int:
 
             sequence_id += 1
             if args.zero_actions:
-                action = np.zeros(7, dtype=np.float64)
+                raw_action = np.zeros(7, dtype=np.float64)
             else:
                 assert policy is not None
                 assert preprocess is not None
@@ -288,9 +597,9 @@ def main() -> int:
                 assert prepare_observation_for_inference is not None
 
                 raw_observation = {
-                    "observation.state": _robot_state_vector(obs),
-                    "observation.images.top": top_camera.read_rgb(top_hw),
-                    "observation.images.third_person_d405": third_person_camera.read_rgb(third_hw),
+                    OBS_STATE_KEY: _robot_state_vector(obs),
+                    TOP_IMAGE_KEY: top_camera.read_rgb(top_hw),
+                    THIRD_PERSON_IMAGE_KEY: third_person_camera.read_rgb(third_hw),
                 }
                 frame = prepare_observation_for_inference(
                     raw_observation,
@@ -301,9 +610,21 @@ def main() -> int:
                 with torch.inference_mode():
                     action_tensor = policy.select_action(preprocess(frame))
                     action_tensor = postprocess(action_tensor)
-                action = action_tensor.squeeze(0).detach().cpu().numpy()
+                raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
 
-            action = _clamp_action(action, args.max_translation_m, args.max_rotation_rad)
+            action, clamp_info = _clamp_action_with_info(raw_action, args.max_translation_m, args.max_rotation_rad)
+            _write_jsonl(action_log, {
+                "timestamp_ns": time.monotonic_ns(),
+                "sequence_id": sequence_id,
+                "source": "zero_actions" if args.zero_actions else "policy",
+                "task": args.task,
+                "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                "raw_action": _jsonable_action(raw_action),
+                "clamped_action": _jsonable_action(action),
+                "max_translation_m": args.max_translation_m,
+                "max_rotation_rad": args.max_rotation_rad,
+                **clamp_info,
+            })
             _send_action(action_sock, dst, sequence_id, action, enabled=True)
 
             elapsed = time.monotonic() - start
@@ -314,6 +635,8 @@ def main() -> int:
     finally:
         obs_rx.stop()
         action_sock.close()
+        if action_log is not None:
+            action_log.close()
         if top_camera is not None:
             top_camera.close()
         if third_person_camera is not None:
