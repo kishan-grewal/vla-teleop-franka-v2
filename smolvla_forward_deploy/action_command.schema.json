@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smolvla_action_command.schema.json",
+  "title": "SmolVLA Franka Action Command",
+  "description": "Action packet produced by SmolVLA forward deployment for Franka.",
+  "type": "object",
+  "required": [
+    "timestamp_ns",
+    "sequence_id",
+    "source",
+    "task",
+    "joint_targets_q1_q7",
+    "gripper_width"
+  ],
+  "properties": {
+    "timestamp_ns": {"type": "integer", "minimum": 0},
+    "sequence_id": {"type": "integer", "minimum": 0},
+    "source": {"type": "string"},
+    "task": {"type": "string"},
+    "joint_targets_q1_q7": {
+      "type": "array",
+      "items": {"type": "number"},
+      "minItems": 7,
+      "maxItems": 7
+    },
+    "gripper_width": {"type": "number"},
+    "raw_action": {
+      "type": "array",
+      "items": {"type": "number"}
+    },
+    "safety": {
+      "type": "object",
+      "properties": {
+        "mode": {"type": "string"},
+        "reason": {"type": "string"},
+        "clipped_indices": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "observation_age_ms": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

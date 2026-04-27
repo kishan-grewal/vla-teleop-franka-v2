@@ -1,0 +1,53 @@
+{
+  "lerobot_root": "../../lerobot",
+  "model_path": "./weights/smolvla_finetuned",
+  "task": "pick up the red block and place it in the bin",
+  "device": "cuda",
+  "observation_udp_host": "127.0.0.1",
+  "observation_udp_port": 28081,
+  "action_udp_host": "127.0.0.1",
+  "action_udp_port": 29001,
+  "state_key": "robot_state",
+  "camera": {
+    "mode": "dummy",
+    "image_key": "observation.images.top",
+    "height": 480,
+    "width": 640,
+    "index": 0
+  },
+  "loop_hz": 10.0,
+  "max_steps": 0,
+  "print_every": 10,
+  "action_dim": 8,
+  "save_actions_jsonl": "./artifacts/actions.jsonl",
+  "safety": {
+    "enabled": true,
+    "require_armed_file": true,
+    "armed_file": "./ARMED",
+    "estop_file": "./ESTOP",
+    "max_observation_age_ms": 150.0,
+    "socket_timeout_ms": 500,
+    "hold_on_stale_observation": true,
+    "fail_closed_on_missing_timestamp": true,
+    "enforce_monotonic_sequence": true,
+    "blocked_fault_flags": [
+      "packet_timeout",
+      "jump_rejected",
+      "workspace_clamped",
+      "robot_not_ready",
+      "control_exception",
+      "ik_rejected"
+    ],
+    "require_target_fresh": false,
+    "require_teleop_active": false,
+    "allowed_control_modes": [],
+    "hold_on_policy_error": true,
+    "joint_position_margin_rad": 0.10,
+    "max_joint_step_rad": 0.008,
+    "max_joint_speed_rad_s": 0.35,
+    "max_joint_acceleration_rad_s2": 1.5,
+    "target_smoothing_alpha": 0.25,
+    "gripper_width_min_m": 0.0,
+    "gripper_width_max_m": 0.08
+  }
+}
