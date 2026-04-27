@@ -37,3 +37,11 @@ venv/
 .env.*
 
 *.log
+
+# Recordings
+recordings/
+franka_xr_teleop/recordings/
+
+# VLA models
+model/
+policy_previews/

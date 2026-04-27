@@ -315,7 +315,6 @@ bool SolveIkStep(const franka::Model& model,
       jacobian_task.transpose() * a_ldlt.solve(jacobian_task);
   Eigen::Matrix<double, 7, 1> dq =
       dq_primary + config.ik.nullspace_gain * nullspace_projector * (q_home - q_current);
-
   const double dt = 1.0 / config.teleop.planner_rate_hz;
   std::array<double, 7> q_next = snapshot.q_d;
   const double max_step_by_velocity = config.ik.max_joint_velocity_radps * dt;

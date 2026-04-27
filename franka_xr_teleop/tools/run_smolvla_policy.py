@@ -15,14 +15,38 @@ from typing import Any, TextIO
 
 import numpy as np
 
+from record_realsense_camera import import_dependencies as import_realsense_dependencies
+from record_zed_camera import import_dependencies as import_zed_dependencies
+from record_zed_camera import timestamp_to_ns as zed_timestamp_to_ns
+
 
 OBS_STATE_KEY = "observation.state"
 TOP_IMAGE_KEY = "observation.images.top"
 THIRD_PERSON_IMAGE_KEY = "observation.images.third_person_d405"
 ACTION_KEY = "action"
-LIVE_INPUT_KEYS = (OBS_STATE_KEY, TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
 EXPECTED_STATE_DIM = 8
 EXPECTED_ACTION_DIM = 7
+SUPPORTED_PYTHON_MIN = (3, 12)
+SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
+
+
+def _ensure_supported_python() -> None:
+    if "-h" in sys.argv or "--help" in sys.argv or "--list-cameras" in sys.argv:
+        return
+    version = sys.version_info[:3]
+    if SUPPORTED_PYTHON_MIN <= version < SUPPORTED_PYTHON_MAX_EXCLUSIVE:
+        return
+    current = ".".join(str(v) for v in version)
+    min_supported = ".".join(str(v) for v in SUPPORTED_PYTHON_MIN)
+    max_supported = ".".join(str(v) for v in (3, 13))
+    raise RuntimeError(
+        "run_smolvla_policy.py must be run with Python "
+        f"{min_supported}-{max_supported}. Current interpreter: {current} "
+        f"({sys.executable}). "
+        "This local lerobot checkout uses draccus config parsing that is not "
+        "working correctly under Python 3.14 here. Recreate or activate a "
+        "Python 3.12/3.13 environment, then rerun the script."
+    )
 
 
 class LatestRobotObservation:
@@ -62,50 +86,126 @@ class LatestRobotObservation:
                 with self._lock:
                     self._latest = obs
 
-
-class OpenCVCamera:
-    def __init__(self, source: str, width: int | None = None, height: int | None = None) -> None:
-        import cv2
-
+class ZedLeftCamera:
+    def __init__(self, serial: int, resolution: str, fps: int) -> None:
+        cv2, _np, sl = import_zed_dependencies()
         self._cv2 = cv2
-        self.source = source
-        self._cap = cv2.VideoCapture(_parse_camera_source(source))
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Failed to open camera source {source!r}")
-        if width:
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height:
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._sl = sl
+        self._zed = sl.Camera()
+        self._image = sl.Mat()
+        self._runtime = sl.RuntimeParameters()
+
+        init = sl.InitParameters()
+        init.camera_resolution = getattr(sl.RESOLUTION, resolution)
+        init.camera_fps = fps
+        init.coordinate_units = sl.UNIT.METER
+        init.depth_mode = sl.DEPTH_MODE.NONE
+        if serial:
+            init.set_from_serial_number(serial)
+
+        err = self._zed.open(init)
+        if err != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to open ZED camera: {err}")
+
+        info = self._zed.get_camera_information()
+        self.source = f"zed-left(serial={getattr(info, 'serial_number', serial or 'first')})"
+        self._reported_width = None
+        self._reported_height = None
+        self._reported_fps = float(fps)
+        if hasattr(info, "camera_configuration"):
+            config = info.camera_configuration
+            self._reported_width = getattr(config.resolution, "width", None) if hasattr(config, "resolution") else None
+            self._reported_height = getattr(config.resolution, "height", None) if hasattr(config, "resolution") else None
+            self._reported_fps = float(getattr(config, "fps", fps))
+        self._serial = getattr(info, "serial_number", serial or None)
+        self._model = str(getattr(info, "camera_model", ""))
+        self._last_timestamp_ns: int | None = None
 
     def read_rgb(self, target_hw: tuple[int, int] | None = None) -> np.ndarray:
-        ok, bgr = self._cap.read()
-        if not ok or bgr is None:
-            raise RuntimeError("Camera frame read failed")
+        err = self._zed.grab(self._runtime)
+        if err != self._sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"ZED grab failed: {err}")
+        self._zed.retrieve_image(self._image, self._sl.VIEW.LEFT)
+        self._last_timestamp_ns = zed_timestamp_to_ns(self._zed.get_timestamp(self._sl.TIME_REFERENCE.IMAGE))
+        bgra = self._image.get_data()
+        rgb = self._cv2.cvtColor(bgra, self._cv2.COLOR_BGRA2RGB)
         if target_hw is not None:
             h, w = target_hw
-            if bgr.shape[:2] != (h, w):
-                bgr = self._cv2.resize(bgr, (w, h), interpolation=self._cv2.INTER_AREA)
-        return self._cv2.cvtColor(bgr, self._cv2.COLOR_BGR2RGB)
+            if rgb.shape[:2] != (h, w):
+                rgb = self._cv2.resize(rgb, (w, h), interpolation=self._cv2.INTER_AREA)
+        return rgb
 
     def close(self) -> None:
-        self._cap.release()
+        self._zed.close()
 
     def properties(self) -> dict[str, Any]:
-        fourcc = int(self._cap.get(self._cv2.CAP_PROP_FOURCC))
-        fourcc_text = "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00")
         return {
             "source": self.source,
-            "backend": self._cap.getBackendName() if hasattr(self._cap, "getBackendName") else None,
-            "reported_width": float(self._cap.get(self._cv2.CAP_PROP_FRAME_WIDTH)),
-            "reported_height": float(self._cap.get(self._cv2.CAP_PROP_FRAME_HEIGHT)),
-            "reported_fps": float(self._cap.get(self._cv2.CAP_PROP_FPS)),
-            "fourcc": fourcc_text,
+            "backend": "pyzed.sl",
+            "reported_width": float(self._reported_width or 0),
+            "reported_height": float(self._reported_height or 0),
+            "reported_fps": self._reported_fps,
+            "fourcc": "BGRA",
+            "serial_number": self._serial,
+            "camera_model": self._model,
+            "zed_view": "LEFT",
+            "zed_timestamp_ns": self._last_timestamp_ns,
         }
 
 
-def _parse_camera_source(value: str) -> int | str:
-    return int(value) if value.isdigit() else value
+class RealSenseColorCamera:
+    def __init__(self, serial: str, width: int, height: int, fps: int) -> None:
+        cv2, np, rs = import_realsense_dependencies()
+        self._cv2 = cv2
+        self._np = np
+        self._rs = rs
+        self._pipeline = rs.pipeline()
+        self._config = rs.config()
+        if serial:
+            self._config.enable_device(serial)
+        self._config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self._profile = self._pipeline.start(self._config)
+        self._width = width
+        self._height = height
+        self._fps = float(fps)
+
+        dev = self._profile.get_device()
+        self._serial = dev.get_info(rs.camera_info.serial_number)
+        self._name = dev.get_info(rs.camera_info.name)
+        self.source = f"realsense(serial={self._serial})"
+        self._last_timestamp_ms: float | None = None
+
+    def read_rgb(self, target_hw: tuple[int, int] | None = None) -> np.ndarray:
+        frames = self._pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            raise RuntimeError("RealSense color frame unavailable")
+        self._last_timestamp_ms = float(color_frame.get_timestamp())
+        bgr = self._np.asanyarray(color_frame.get_data())
+        if bgr.shape[:2] != (self._height, self._width):
+            bgr = self._cv2.resize(bgr, (self._width, self._height), interpolation=self._cv2.INTER_AREA)
+        rgb = self._cv2.cvtColor(bgr, self._cv2.COLOR_BGR2RGB)
+        if target_hw is not None:
+            h, w = target_hw
+            if rgb.shape[:2] != (h, w):
+                rgb = self._cv2.resize(rgb, (w, h), interpolation=self._cv2.INTER_AREA)
+        return rgb
+
+    def close(self) -> None:
+        self._pipeline.stop()
+
+    def properties(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "backend": "pyrealsense2",
+            "reported_width": float(self._width),
+            "reported_height": float(self._height),
+            "reported_fps": self._fps,
+            "fourcc": "BGR8",
+            "serial_number": self._serial,
+            "camera_model": self._name,
+            "realsense_timestamp_ms": self._last_timestamp_ms,
+        }
 
 
 def _resolve_lerobot_root(explicit_root: Path | None) -> Path:
@@ -189,7 +289,7 @@ def _feature_summary(features: dict[str, Any] | None) -> dict[str, dict[str, Any
     }
 
 
-def _validate_policy_features(policy: Any, print_full: bool = False) -> dict[str, Any]:
+def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_full: bool = False) -> dict[str, Any]:
     input_features = policy.config.input_features or {}
     output_features = policy.config.output_features or {}
     image_features = getattr(policy.config, "image_features", {}) or {}
@@ -203,7 +303,7 @@ def _validate_policy_features(policy: Any, print_full: bool = False) -> dict[str
             f"{OBS_STATE_KEY!r} must have shape [{EXPECTED_STATE_DIM}], got {list(state_shape or [])}"
         )
 
-    for key in (TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY):
+    for key in image_keys:
         image_shape = _feature_shape(input_features.get(key))
         if key not in input_features:
             errors.append(f"missing required image feature {key!r}")
@@ -219,7 +319,7 @@ def _validate_policy_features(policy: Any, print_full: bool = False) -> dict[str
     elif action_shape != (EXPECTED_ACTION_DIM,):
         errors.append(f"{ACTION_KEY!r} must have shape [{EXPECTED_ACTION_DIM}], got {list(action_shape or [])}")
 
-    supplied_live_keys = set(LIVE_INPUT_KEYS)
+    supplied_live_keys = {OBS_STATE_KEY, *image_keys}
     missing_live_image_keys = [
         key for key in image_features
         if key not in supplied_live_keys and not key.startswith("observation.images.empty_camera")
@@ -233,14 +333,15 @@ def _validate_policy_features(policy: Any, print_full: bool = False) -> dict[str
     summary = {
         "input_features": _feature_summary(input_features),
         "output_features": _feature_summary(output_features),
-        "live_observation_keys": list(LIVE_INPUT_KEYS),
+        "live_observation_keys": [OBS_STATE_KEY, *image_keys],
         "expected_state_dim": EXPECTED_STATE_DIM,
         "expected_action_dim": EXPECTED_ACTION_DIM,
         "image_features": sorted(image_features),
     }
 
     print("Policy feature compatibility:", flush=True)
-    for key in LIVE_INPUT_KEYS:
+    print(f"  live {OBS_STATE_KEY}: policy shape={summary['input_features'].get(OBS_STATE_KEY, {}).get('shape')}", flush=True)
+    for key in image_keys:
         print(f"  live {key}: policy shape={summary['input_features'].get(key, {}).get('shape')}", flush=True)
     print(f"  live {ACTION_KEY}: policy shape={summary['output_features'].get(ACTION_KEY, {}).get('shape')}", flush=True)
     if print_full:
@@ -353,7 +454,7 @@ def _save_preview_frame(path: Path, image_rgb: np.ndarray, label: str) -> None:
 
 
 def _capture_startup_preview(
-    camera: OpenCVCamera,
+    camera: Any,
     policy_key: str,
     target_hw: tuple[int, int],
     sample_count: int,
@@ -402,8 +503,43 @@ def _print_camera_summary(summary: dict[str, Any]) -> None:
     )
 
 
+def _list_realsense_devices() -> None:
+    _cv2, _np, rs = import_realsense_dependencies()
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    print(f"realsense_device_count={len(devices)}")
+    for index, dev in enumerate(devices):
+        serial = dev.get_info(rs.camera_info.serial_number)
+        name = dev.get_info(rs.camera_info.name)
+        firmware = dev.get_info(rs.camera_info.firmware_version)
+        usb_type = dev.get_info(rs.camera_info.usb_type_descriptor)
+        print(f"realsense[{index}]: name={name} serial={serial} firmware={firmware} usb={usb_type}")
+
+
+def _list_zed_devices() -> None:
+    _cv2, _np, sl = import_zed_dependencies()
+    devices = sl.Camera.get_device_list()
+    print(f"zed_device_count={len(devices)}")
+    for index, dev in enumerate(devices):
+        serial = getattr(dev, "serial_number", None)
+        model = getattr(dev, "camera_model", None)
+        state = getattr(dev, "camera_state", None)
+        print(f"zed[{index}]: serial={serial} model={model} state={state}")
+
+
+def _list_available_cameras() -> int:
+    _list_realsense_devices()
+    _list_zed_devices()
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="List available RealSense and ZED devices with serials, then exit.",
+    )
     parser.add_argument("--policy-path", type=Path, default=None)
     parser.add_argument("--lerobot-root", type=Path, default=None)
     parser.add_argument("--device", default="cuda")
@@ -414,19 +550,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge-ip", default="127.0.0.1")
     parser.add_argument("--action-port", type=int, default=28082)
     parser.add_argument("--rate-hz", type=float, default=10.0)
-    parser.add_argument("--top-camera", default="0", help="OpenCV source for observation.images.top")
     parser.add_argument(
-        "--third-person-camera",
-        default="1",
-        help="OpenCV source for observation.images.third_person_d405",
+        "--top-camera-backend",
+        choices=["realsense", "zed-left"],
+        default="realsense",
+        help="SDK-backed source for observation.images.top.",
     )
+    parser.add_argument(
+        "--third-person-camera-backend",
+        choices=["realsense", "zed-left"],
+        default="zed-left",
+        help=(
+            "SDK-backed source for observation.images.third_person_d405. "
+            "TODO: revisit these defaults and names once policy camera conventions are cleaned up."
+        ),
+    )
+    parser.add_argument("--zed-serial", type=int, default=0, help="ZED serial number; 0 uses the first camera.")
+    parser.add_argument(
+        "--zed-resolution",
+        default="HD720",
+        choices=["VGA", "HD720", "HD1080", "HD2K"],
+        help="ZED camera resolution requested from the SDK.",
+    )
+    parser.add_argument("--zed-fps", type=int, default=30, help="ZED camera FPS requested from the SDK.")
+    parser.add_argument("--realsense-serial", default="", help="RealSense serial number; empty uses the first camera.")
+    parser.add_argument("--realsense-color-width", type=int, default=1280)
+    parser.add_argument("--realsense-color-height", type=int, default=720)
+    parser.add_argument("--realsense-fps", type=int, default=30)
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
-    parser.add_argument(
-        "--allow-default-camera-indices",
-        action="store_true",
-        help="Allow unsafe default OpenCV camera indices 0/1. Prefer explicit device paths or serial-backed sources.",
-    )
     parser.add_argument(
         "--preview-dir",
         type=Path,
@@ -466,18 +618,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    _ensure_supported_python()
     args = parse_args()
+    if args.list_cameras:
+        return _list_available_cameras()
     if args.rate_hz <= 0:
         raise ValueError("--rate-hz must be > 0")
+    if args.zed_fps <= 0:
+        raise ValueError("--zed-fps must be > 0")
+    if args.realsense_fps <= 0:
+        raise ValueError("--realsense-fps must be > 0")
     if not args.zero_actions and args.policy_path is None:
         raise ValueError("--policy-path is required unless --zero-actions is set")
-    if not args.zero_actions and not args.allow_default_camera_indices:
-        if args.top_camera == "0" and args.third_person_camera == "1":
-            raise ValueError(
-                "Default OpenCV camera indices are unsafe for policy deployment. "
-                "Pass explicit --top-camera/--third-person-camera sources, or add "
-                "--allow-default-camera-indices after verifying the startup preview frames."
-            )
     if args.camera_preview_samples <= 0:
         raise ValueError("--camera-preview-samples must be > 0")
 
@@ -511,24 +663,33 @@ def main() -> int:
             policy = SmolVLAPolicy.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
-            policy_features = _validate_policy_features(policy, args.print_policy_features)
+            image_keys = (TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
+            policy_features = _validate_policy_features(policy, image_keys, args.print_policy_features)
             preprocess, postprocess = make_pre_post_processors(
                 policy.config,
                 policy_path,
                 preprocessor_overrides={"device_processor": {"device": str(device)}},
             )
             top_hw = _feature_image_shape(policy, TOP_IMAGE_KEY, (args.camera_height, args.camera_width))
-            third_hw = _feature_image_shape(
-                policy,
-                THIRD_PERSON_IMAGE_KEY,
-                (args.camera_height, args.camera_width),
-            )
-            top_camera = OpenCVCamera(args.top_camera, args.camera_width, args.camera_height)
-            third_person_camera = OpenCVCamera(
-                args.third_person_camera,
-                args.camera_width,
-                args.camera_height,
-            )
+            third_hw = _feature_image_shape(policy, THIRD_PERSON_IMAGE_KEY, (args.camera_height, args.camera_width))
+            if args.top_camera_backend == "realsense":
+                top_camera = RealSenseColorCamera(
+                    args.realsense_serial,
+                    args.realsense_color_width,
+                    args.realsense_color_height,
+                    args.realsense_fps,
+                )
+            else:
+                top_camera = ZedLeftCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
+            if args.third_person_camera_backend == "realsense":
+                third_person_camera = RealSenseColorCamera(
+                    args.realsense_serial,
+                    args.realsense_color_width,
+                    args.realsense_color_height,
+                    args.realsense_fps,
+                )
+            else:
+                third_person_camera = ZedLeftCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
             preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
             top_preview = _capture_startup_preview(
                 top_camera,
