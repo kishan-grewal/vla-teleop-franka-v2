@@ -442,6 +442,19 @@ def _jsonable_action(action: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
 
 
+def _policy_action_queue_size(policy: Any) -> int | None:
+    queues = getattr(policy, "_queues", None)
+    if not isinstance(queues, dict):
+        return None
+    queue = queues.get(ACTION_KEY)
+    if queue is None:
+        return None
+    try:
+        return len(queue)
+    except TypeError:
+        return None
+
+
 def _reset_if_supported(name: str, component: Any) -> str | None:
     reset = getattr(component, "reset", None)
     if not callable(reset):
@@ -864,6 +877,9 @@ def main() -> int:
             sequence_id += 1
             camera_read_time_ms: float | None = None
             inference_time_ms: float | None = None
+            policy_action_queue_before: int | None = None
+            policy_action_queue_after: int | None = None
+            policy_chunk_refill: bool | None = None
             if args.zero_actions:
                 raw_action = np.zeros(7, dtype=np.float64)
             else:
@@ -893,7 +909,12 @@ def main() -> int:
                     robot_type=args.robot_type,
                 )
                 with torch.inference_mode():
+                    policy_action_queue_before = _policy_action_queue_size(policy)
                     action_tensor = policy.select_action(preprocess(frame))
+                    policy_action_queue_after = _policy_action_queue_size(policy)
+                    policy_chunk_refill = (
+                        policy_action_queue_before == 0 and policy_action_queue_after is not None
+                    )
                     action_tensor = postprocess(action_tensor)
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
                 inference_time_ms = (time.monotonic() - inference_start) * 1_000.0
@@ -914,6 +935,9 @@ def main() -> int:
                 "camera_read_time_ms": camera_read_time_ms,
                 "inference_time_ms": inference_time_ms,
                 "loop_time_ms": loop_time_ms,
+                "policy_action_queue_before": policy_action_queue_before,
+                "policy_action_queue_after": policy_action_queue_after,
+                "policy_chunk_refill": policy_chunk_refill,
                 "raw_action": _jsonable_action(raw_action),
                 "clamped_action": _jsonable_action(action),
                 "max_translation_m": args.max_translation_m,
