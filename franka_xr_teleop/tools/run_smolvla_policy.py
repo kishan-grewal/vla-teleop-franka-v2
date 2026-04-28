@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -28,6 +29,13 @@ EXPECTED_STATE_DIM = 8
 EXPECTED_ACTION_DIM = 7
 SUPPORTED_PYTHON_MIN = (3, 12)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
+
+
+@dataclass(frozen=True)
+class ReceivedRobotObservation:
+    observation: dict[str, Any]
+    host_time_ns: int
+    monotonic_ns: int
 
 
 def _ensure_supported_python() -> None:
@@ -57,7 +65,7 @@ class LatestRobotObservation:
         self._sock.bind((bind_ip, port))
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._latest: dict[str, Any] | None = None
+        self._latest: ReceivedRobotObservation | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -68,7 +76,7 @@ class LatestRobotObservation:
         self._thread.join(timeout=1.0)
         self._sock.close()
 
-    def latest(self) -> dict[str, Any] | None:
+    def latest(self) -> ReceivedRobotObservation | None:
         with self._lock:
             return self._latest
 
@@ -83,8 +91,13 @@ class LatestRobotObservation:
             except json.JSONDecodeError:
                 continue
             if isinstance(obs, dict):
+                received = ReceivedRobotObservation(
+                    observation=obs,
+                    host_time_ns=time.time_ns(),
+                    monotonic_ns=time.monotonic_ns(),
+                )
                 with self._lock:
-                    self._latest = obs
+                    self._latest = received
 
 class ZedLeftCamera:
     def __init__(self, serial: int, resolution: str, fps: int) -> None:
@@ -547,6 +560,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-type", default="franka")
     parser.add_argument("--obs-bind-ip", default="0.0.0.0")
     parser.add_argument("--obs-port", type=int, default=28081)
+    parser.add_argument(
+        "--max-obs-age-ms",
+        type=float,
+        default=250.0,
+        help="Maximum age for the latest robot observation before skipping action sends.",
+    )
     parser.add_argument("--bridge-ip", default="127.0.0.1")
     parser.add_argument("--action-port", type=int, default=28082)
     parser.add_argument("--rate-hz", type=float, default=30.0)
@@ -621,6 +640,8 @@ def main() -> int:
         return _list_available_cameras()
     if args.rate_hz <= 0:
         raise ValueError("--rate-hz must be > 0")
+    if args.max_obs_age_ms <= 0:
+        raise ValueError("--max-obs-age-ms must be > 0")
     if args.zed_fps <= 0:
         raise ValueError("--zed-fps must be > 0")
     if args.realsense_fps <= 0:
@@ -735,14 +756,46 @@ def main() -> int:
         )
 
         sequence_id = 0
+        last_stale_warning_mono = 0.0
         while True:
             start = time.monotonic()
-            obs = obs_rx.latest()
-            if obs is None:
+            loop_start_mono = start
+            received_obs = obs_rx.latest()
+            if received_obs is None:
+                time.sleep(min(period_s, 0.05))
+                continue
+            obs_age_ms = (time.monotonic_ns() - received_obs.monotonic_ns) / 1_000_000.0
+            if obs_age_ms > args.max_obs_age_ms:
+                now = time.monotonic()
+                if (now - last_stale_warning_mono) >= 1.0:
+                    last_stale_warning_mono = now
+                    print(
+                        "Skipping action send: latest robot observation is stale "
+                        f"({obs_age_ms:.1f}ms > {args.max_obs_age_ms:.1f}ms)",
+                        flush=True,
+                    )
+                    _write_jsonl(action_log, {
+                        "event": "stale_observation_skip",
+                        "timestamp_ns": time.monotonic_ns(),
+                        "source": "zero_actions" if args.zero_actions else "policy",
+                        "task": args.task,
+                        "robot_observation_timestamp_ns": received_obs.observation.get("timestamp_ns"),
+                        "robot_observation_host_time_ns": received_obs.host_time_ns,
+                        "robot_observation_age_ms": obs_age_ms,
+                        "max_obs_age_ms": args.max_obs_age_ms,
+                        "stale_observation": True,
+                        "camera_read_time_ms": None,
+                        "inference_time_ms": None,
+                        "loop_time_ms": (time.monotonic() - loop_start_mono) * 1_000.0,
+                    })
                 time.sleep(min(period_s, 0.05))
                 continue
 
+            obs = received_obs.observation
+
             sequence_id += 1
+            camera_read_time_ms: float | None = None
+            inference_time_ms: float | None = None
             if args.zero_actions:
                 raw_action = np.zeros(7, dtype=np.float64)
             else:
@@ -754,11 +807,17 @@ def main() -> int:
                 assert torch is not None
                 assert prepare_observation_for_inference is not None
 
+                camera_read_start = time.monotonic()
+                top_image = top_camera.read_rgb(top_hw)
+                third_person_image = third_person_camera.read_rgb(third_hw)
+                camera_read_time_ms = (time.monotonic() - camera_read_start) * 1_000.0
+
                 raw_observation = {
                     OBS_STATE_KEY: _robot_state_vector(obs),
-                    TOP_IMAGE_KEY: top_camera.read_rgb(top_hw),
-                    THIRD_PERSON_IMAGE_KEY: third_person_camera.read_rgb(third_hw),
+                    TOP_IMAGE_KEY: top_image,
+                    THIRD_PERSON_IMAGE_KEY: third_person_image,
                 }
+                inference_start = time.monotonic()
                 frame = prepare_observation_for_inference(
                     raw_observation,
                     torch.device(args.device),
@@ -769,21 +828,30 @@ def main() -> int:
                     action_tensor = policy.select_action(preprocess(frame))
                     action_tensor = postprocess(action_tensor)
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
+                inference_time_ms = (time.monotonic() - inference_start) * 1_000.0
 
             action, clamp_info = _clamp_action_with_info(raw_action, args.max_translation_m, args.max_rotation_rad)
+            _send_action(action_sock, dst, sequence_id, action, enabled=True)
+            loop_time_ms = (time.monotonic() - loop_start_mono) * 1_000.0
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
                 "source": "zero_actions" if args.zero_actions else "policy",
                 "task": args.task,
                 "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                "robot_observation_host_time_ns": received_obs.host_time_ns,
+                "robot_observation_age_ms": obs_age_ms,
+                "max_obs_age_ms": args.max_obs_age_ms,
+                "stale_observation": False,
+                "camera_read_time_ms": camera_read_time_ms,
+                "inference_time_ms": inference_time_ms,
+                "loop_time_ms": loop_time_ms,
                 "raw_action": _jsonable_action(raw_action),
                 "clamped_action": _jsonable_action(action),
                 "max_translation_m": args.max_translation_m,
                 "max_rotation_rad": args.max_rotation_rad,
                 **clamp_info,
             })
-            _send_action(action_sock, dst, sequence_id, action, enabled=True)
 
             elapsed = time.monotonic() - start
             if elapsed < period_s:
