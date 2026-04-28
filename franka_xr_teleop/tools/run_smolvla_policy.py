@@ -553,17 +553,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-camera-backend",
         choices=["realsense", "zed-left"],
-        default="realsense",
+        default="zed-left",
         help="SDK-backed source for observation.images.top.",
     )
     parser.add_argument(
         "--third-person-camera-backend",
         choices=["realsense", "zed-left"],
-        default="zed-left",
-        help=(
-            "SDK-backed source for observation.images.third_person_d405. "
-            "TODO: revisit these defaults and names once policy camera conventions are cleaned up."
-        ),
+        default="realsense",
+        help="SDK-backed source for observation.images.third_person_d405.",
     )
     parser.add_argument("--zed-serial", type=int, default=0, help="ZED serial number; 0 uses the first camera.")
     parser.add_argument(
