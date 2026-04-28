@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,20 @@ class ReceivedRobotObservation:
     observation: dict[str, Any]
     host_time_ns: int
     monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class QueuedPolicyAction:
+    raw_action: np.ndarray
+    chunk_sequence_id: int
+    chunk_index: int
+    chunk_size: int
+    chunk_created_monotonic_ns: int
+    chunk_inference_time_ms: float
+    chunk_camera_read_time_ms: float
+    robot_observation_timestamp_ns: Any
+    robot_observation_host_time_ns: int
+    robot_observation_age_ms_at_inference: float
 
 
 def _ensure_supported_python() -> None:
@@ -455,6 +470,228 @@ def _policy_action_queue_size(policy: Any) -> int | None:
         return None
 
 
+def _policy_config_positive_int(policy: Any, name: str, fallback: int | None = None) -> int | None:
+    value = getattr(policy.config, name, None)
+    if value is None:
+        return fallback
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"policy.config.{name} must be a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"policy.config.{name} must be a positive integer, got {parsed}")
+    return parsed
+
+
+class AsyncChunkPolicyRunner:
+    def __init__(
+        self,
+        *,
+        policy: Any,
+        preprocess: Any,
+        postprocess: Any,
+        policy_lock: threading.Lock,
+        prepare_observation_for_inference: Any,
+        torch_module: Any,
+        device: Any,
+        task: str,
+        robot_type: str,
+        obs_rx: LatestRobotObservation,
+        top_camera: Any,
+        third_person_camera: Any,
+        top_hw: tuple[int, int],
+        third_hw: tuple[int, int],
+        max_obs_age_ms: float,
+        actions_per_chunk: int,
+        refill_threshold: float,
+        max_queued_actions: int,
+    ) -> None:
+        self._policy = policy
+        self._preprocess = preprocess
+        self._postprocess = postprocess
+        self._policy_lock = policy_lock
+        self._prepare_observation_for_inference = prepare_observation_for_inference
+        self._torch = torch_module
+        self._device = device
+        self._task = task
+        self._robot_type = robot_type
+        self._obs_rx = obs_rx
+        self._top_camera = top_camera
+        self._third_person_camera = third_person_camera
+        self._top_hw = top_hw
+        self._third_hw = third_hw
+        self._max_obs_age_ms = max_obs_age_ms
+        self._actions_per_chunk = actions_per_chunk
+        self._refill_threshold_count = max(0, int(round(actions_per_chunk * refill_threshold)))
+        self._max_queued_actions = max_queued_actions
+
+        self._condition = threading.Condition()
+        self._queue: deque[QueuedPolicyAction] = deque()
+        self._stop = threading.Event()
+        self._busy = False
+        self._generation = 0
+        self._chunk_sequence_id = 0
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        self._thread.join(timeout=5.0)
+
+    def qsize(self) -> int:
+        with self._condition:
+            return len(self._queue)
+
+    def clear(self) -> None:
+        with self._condition:
+            self._queue.clear()
+            self._generation += 1
+            self._condition.notify_all()
+
+    def reset_policy_runtime(self) -> list[str]:
+        with self._policy_lock:
+            reset_components = _reset_policy_runtime(self._policy, self._preprocess, self._postprocess)
+        self.clear()
+        return reset_components
+
+    def pop_action(self) -> tuple[QueuedPolicyAction | None, int, int]:
+        with self._condition:
+            queue_before = len(self._queue)
+            if not self._queue:
+                self._condition.notify_all()
+                return None, queue_before, queue_before
+            action = self._queue.popleft()
+            queue_after = len(self._queue)
+            self._condition.notify_all()
+            return action, queue_before, queue_after
+
+    def raise_if_failed(self) -> None:
+        with self._condition:
+            error = self._error
+        if error is not None:
+            raise RuntimeError("Async policy chunk worker failed") from error
+
+    def _should_refill_locked(self) -> bool:
+        return (
+            self._error is None
+            and not self._busy
+            and len(self._queue) <= self._refill_threshold_count
+            and len(self._queue) < self._max_queued_actions
+        )
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            with self._condition:
+                while not self._stop.is_set() and not self._should_refill_locked():
+                    self._condition.wait(timeout=0.05)
+                if self._stop.is_set():
+                    return
+                self._busy = True
+                generation = self._generation
+
+            try:
+                actions = self._build_chunk(generation)
+                if actions is None:
+                    time.sleep(0.02)
+                    continue
+
+                with self._condition:
+                    if generation == self._generation:
+                        available = self._max_queued_actions - len(self._queue)
+                        for action in actions[:available]:
+                            self._queue.append(action)
+                    self._condition.notify_all()
+            except BaseException as exc:
+                with self._condition:
+                    self._error = exc
+                    self._condition.notify_all()
+                return
+            finally:
+                with self._condition:
+                    self._busy = False
+                    self._condition.notify_all()
+
+    def _build_chunk(self, generation: int) -> list[QueuedPolicyAction] | None:
+        received_obs = self._obs_rx.latest()
+        if received_obs is None:
+            return None
+
+        obs_age_ms = (time.monotonic_ns() - received_obs.monotonic_ns) / 1_000_000.0
+        if obs_age_ms > self._max_obs_age_ms:
+            return None
+
+        obs = received_obs.observation
+        camera_read_start = time.monotonic()
+        top_image = self._top_camera.read_rgb(self._top_hw)
+        third_person_image = self._third_person_camera.read_rgb(self._third_hw)
+        camera_read_time_ms = (time.monotonic() - camera_read_start) * 1_000.0
+
+        raw_observation = {
+            OBS_STATE_KEY: _robot_state_vector(obs),
+            TOP_IMAGE_KEY: top_image,
+            THIRD_PERSON_IMAGE_KEY: third_person_image,
+        }
+
+        inference_start = time.monotonic()
+        with self._policy_lock:
+            frame = self._prepare_observation_for_inference(
+                raw_observation,
+                self._device,
+                task=self._task,
+                robot_type=self._robot_type,
+            )
+            with self._torch.inference_mode():
+                action_chunk = self._policy.predict_action_chunk(self._preprocess(frame))
+                action_chunk = self._postprocess(action_chunk)
+        inference_time_ms = (time.monotonic() - inference_start) * 1_000.0
+
+        if generation != self._generation:
+            return None
+
+        action_array = action_chunk.detach().cpu().numpy()
+        if action_array.ndim == 3:
+            if action_array.shape[0] != 1:
+                raise ValueError(f"Expected batch size 1 for action chunk, got shape {action_array.shape}")
+            action_array = action_array[0]
+        elif action_array.ndim == 1:
+            action_array = action_array.reshape(1, -1)
+        elif action_array.ndim != 2:
+            raise ValueError(f"Expected action chunk shape [T,7] or [1,T,7], got {action_array.shape}")
+        if action_array.shape[1] != EXPECTED_ACTION_DIM:
+            raise ValueError(f"Expected action chunk dim {EXPECTED_ACTION_DIM}, got shape {action_array.shape}")
+
+        action_array = action_array[: self._actions_per_chunk]
+        chunk_size = int(action_array.shape[0])
+        if chunk_size == 0:
+            return None
+
+        with self._condition:
+            self._chunk_sequence_id += 1
+            chunk_sequence_id = self._chunk_sequence_id
+
+        created_ns = time.monotonic_ns()
+        return [
+            QueuedPolicyAction(
+                raw_action=np.asarray(action_array[index], dtype=np.float64).reshape(-1),
+                chunk_sequence_id=chunk_sequence_id,
+                chunk_index=index,
+                chunk_size=chunk_size,
+                chunk_created_monotonic_ns=created_ns,
+                chunk_inference_time_ms=inference_time_ms,
+                chunk_camera_read_time_ms=camera_read_time_ms,
+                robot_observation_timestamp_ns=obs.get("timestamp_ns"),
+                robot_observation_host_time_ns=received_obs.host_time_ns,
+                robot_observation_age_ms_at_inference=obs_age_ms,
+            )
+            for index in range(chunk_size)
+        ]
+
+
 def _reset_if_supported(name: str, component: Any) -> str | None:
     reset = getattr(component, "reset", None)
     if not callable(reset):
@@ -609,6 +846,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-port", type=int, default=28082)
     parser.add_argument("--rate-hz", type=float, default=30.0)
     parser.add_argument(
+        "--rollout-mode",
+        choices=["sync", "async"],
+        default="sync",
+        help="Policy rollout mode. sync preserves the existing select_action loop; async prefetches action chunks.",
+    )
+    parser.add_argument(
+        "--async-actions-per-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Number of actions to enqueue from each policy chunk when --rollout-mode async is used. "
+            "Default: policy.config.n_action_steps."
+        ),
+    )
+    parser.add_argument(
+        "--async-refill-threshold",
+        type=float,
+        default=0.5,
+        help="Refill async action queue when remaining actions <= this fraction of --async-actions-per-chunk.",
+    )
+    parser.add_argument(
+        "--async-max-queued-actions",
+        type=int,
+        default=None,
+        help=(
+            "Maximum queued policy actions when --rollout-mode async is used. "
+            "Default: 2 * --async-actions-per-chunk."
+        ),
+    )
+    parser.add_argument(
         "--top-camera-backend",
         choices=["realsense", "zed-left"],
         default="zed-left",
@@ -690,6 +957,12 @@ def main() -> int:
         raise ValueError("--zed-fps must be > 0")
     if args.realsense_fps <= 0:
         raise ValueError("--realsense-fps must be > 0")
+    if args.async_actions_per_chunk is not None and args.async_actions_per_chunk <= 0:
+        raise ValueError("--async-actions-per-chunk must be > 0")
+    if not 0.0 <= args.async_refill_threshold <= 1.0:
+        raise ValueError("--async-refill-threshold must be in [0, 1]")
+    if args.async_max_queued_actions is not None and args.async_max_queued_actions <= 0:
+        raise ValueError("--async-max-queued-actions must be > 0")
     if not args.zero_actions and args.policy_path is None:
         raise ValueError("--policy-path is required unless --zero-actions is set")
     if args.camera_preview_samples <= 0:
@@ -704,8 +977,10 @@ def main() -> int:
     policy = None
     preprocess = None
     postprocess = None
+    policy_lock = threading.Lock()
     top_camera = None
     third_person_camera = None
+    async_runner: AsyncChunkPolicyRunner | None = None
     action_log: TextIO | None = None
 
     try:
@@ -725,6 +1000,29 @@ def main() -> int:
             policy = SmolVLAPolicy.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
+            if args.rollout_mode == "async":
+                policy_chunk_size = _policy_config_positive_int(policy, "chunk_size")
+                policy_n_action_steps = _policy_config_positive_int(
+                    policy,
+                    "n_action_steps",
+                    fallback=policy_chunk_size,
+                )
+                if args.async_actions_per_chunk is None:
+                    if policy_n_action_steps is None:
+                        raise ValueError(
+                            "--async-actions-per-chunk is required for async rollout because "
+                            "policy.config does not define n_action_steps or chunk_size"
+                        )
+                    args.async_actions_per_chunk = policy_n_action_steps
+                if args.async_max_queued_actions is None:
+                    args.async_max_queued_actions = 2 * args.async_actions_per_chunk
+                if args.async_max_queued_actions < args.async_actions_per_chunk:
+                    raise ValueError("--async-max-queued-actions must be >= --async-actions-per-chunk")
+                if policy_chunk_size is not None and args.async_actions_per_chunk > policy_chunk_size:
+                    raise ValueError(
+                        "--async-actions-per-chunk must be <= policy.config.chunk_size "
+                        f"({policy_chunk_size})"
+                    )
             image_keys = (TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
             policy_features = _validate_policy_features(policy, image_keys, args.print_policy_features)
             preprocess, postprocess = make_pre_post_processors(
@@ -798,6 +1096,36 @@ def main() -> int:
                 )
                 print(f"Saved camera preview manifest to {manifest_path}", flush=True)
             print(f"Loaded SmolVLA policy from {policy_path}", flush=True)
+
+            if args.rollout_mode == "async":
+                async_runner = AsyncChunkPolicyRunner(
+                    policy=policy,
+                    preprocess=preprocess,
+                    postprocess=postprocess,
+                    policy_lock=policy_lock,
+                    prepare_observation_for_inference=prepare_observation_for_inference,
+                    torch_module=torch,
+                    device=device,
+                    task=args.task,
+                    robot_type=args.robot_type,
+                    obs_rx=obs_rx,
+                    top_camera=top_camera,
+                    third_person_camera=third_person_camera,
+                    top_hw=top_hw,
+                    third_hw=third_hw,
+                    max_obs_age_ms=args.max_obs_age_ms,
+                    actions_per_chunk=args.async_actions_per_chunk,
+                    refill_threshold=args.async_refill_threshold,
+                    max_queued_actions=args.async_max_queued_actions,
+                )
+                async_runner.start()
+                print(
+                    "Using async policy chunk rollout: "
+                    f"actions_per_chunk={args.async_actions_per_chunk}, "
+                    f"refill_threshold={args.async_refill_threshold:.2f}, "
+                    f"max_queued_actions={args.async_max_queued_actions}",
+                    flush=True,
+                )
         else:
             torch = None
             prepare_observation_for_inference = None
@@ -812,16 +1140,22 @@ def main() -> int:
 
         sequence_id = 0
         last_stale_warning_mono = 0.0
+        last_async_empty_warning_mono = 0.0
         last_episode_start = False
         while True:
             start = time.monotonic()
             loop_start_mono = start
+            if async_runner is not None:
+                async_runner.raise_if_failed()
             received_obs = obs_rx.latest()
             if received_obs is None:
                 time.sleep(min(period_s, 0.05))
                 continue
             obs_age_ms = (time.monotonic_ns() - received_obs.monotonic_ns) / 1_000_000.0
             if obs_age_ms > args.max_obs_age_ms:
+                async_queue_size = async_runner.qsize() if async_runner is not None else None
+                if async_runner is not None:
+                    async_runner.clear()
                 now = time.monotonic()
                 if (now - last_stale_warning_mono) >= 1.0:
                     last_stale_warning_mono = now
@@ -840,6 +1174,8 @@ def main() -> int:
                         "robot_observation_age_ms": obs_age_ms,
                         "max_obs_age_ms": args.max_obs_age_ms,
                         "stale_observation": True,
+                        "rollout_mode": "zero_actions" if args.zero_actions else args.rollout_mode,
+                        "async_action_queue_size": async_queue_size,
                         "camera_read_time_ms": None,
                         "inference_time_ms": None,
                         "loop_time_ms": (time.monotonic() - loop_start_mono) * 1_000.0,
@@ -855,7 +1191,10 @@ def main() -> int:
                 and not args.zero_actions
                 and not args.no_reset_policy_on_episode_start
             ):
-                reset_components = _reset_policy_runtime(policy, preprocess, postprocess)
+                if async_runner is not None:
+                    reset_components = async_runner.reset_policy_runtime()
+                else:
+                    reset_components = _reset_policy_runtime(policy, preprocess, postprocess)
                 if reset_components:
                     print(
                         f"Reset policy runtime state on episode_start: {', '.join(reset_components)}",
@@ -874,14 +1213,62 @@ def main() -> int:
                 })
             last_episode_start = episode_start
 
-            sequence_id += 1
             camera_read_time_ms: float | None = None
             inference_time_ms: float | None = None
             policy_action_queue_before: int | None = None
             policy_action_queue_after: int | None = None
             policy_chunk_refill: bool | None = None
+            async_action_queue_before: int | None = None
+            async_action_queue_after: int | None = None
+            async_action_age_ms: float | None = None
+            async_chunk_sequence_id: int | None = None
+            async_chunk_index: int | None = None
+            async_chunk_size: int | None = None
+            action_robot_observation_timestamp_ns: Any = None
+            action_robot_observation_host_time_ns: int | None = None
+            action_robot_observation_age_ms_at_inference: float | None = None
             if args.zero_actions:
                 raw_action = np.zeros(7, dtype=np.float64)
+            elif async_runner is not None:
+                queued_action, async_action_queue_before, async_action_queue_after = async_runner.pop_action()
+                if queued_action is None:
+                    now = time.monotonic()
+                    if (now - last_async_empty_warning_mono) >= 1.0:
+                        last_async_empty_warning_mono = now
+                        print("Skipping action send: async policy action queue is empty", flush=True)
+                        _write_jsonl(action_log, {
+                            "event": "async_action_queue_empty",
+                            "timestamp_ns": time.monotonic_ns(),
+                            "source": "policy",
+                            "task": args.task,
+                            "rollout_mode": args.rollout_mode,
+                            "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                            "robot_observation_host_time_ns": received_obs.host_time_ns,
+                            "robot_observation_age_ms": obs_age_ms,
+                            "async_action_queue_before": async_action_queue_before,
+                            "async_action_queue_after": async_action_queue_after,
+                            "camera_read_time_ms": None,
+                            "inference_time_ms": None,
+                            "loop_time_ms": (time.monotonic() - loop_start_mono) * 1_000.0,
+                        })
+                    time.sleep(min(period_s, 0.05))
+                    continue
+
+                raw_action = queued_action.raw_action
+                camera_read_time_ms = queued_action.chunk_camera_read_time_ms
+                inference_time_ms = queued_action.chunk_inference_time_ms
+                policy_chunk_refill = queued_action.chunk_index == 0
+                async_action_age_ms = (
+                    time.monotonic_ns() - queued_action.chunk_created_monotonic_ns
+                ) / 1_000_000.0
+                async_chunk_sequence_id = queued_action.chunk_sequence_id
+                async_chunk_index = queued_action.chunk_index
+                async_chunk_size = queued_action.chunk_size
+                action_robot_observation_timestamp_ns = queued_action.robot_observation_timestamp_ns
+                action_robot_observation_host_time_ns = queued_action.robot_observation_host_time_ns
+                action_robot_observation_age_ms_at_inference = (
+                    queued_action.robot_observation_age_ms_at_inference
+                )
             else:
                 assert policy is not None
                 assert preprocess is not None
@@ -908,18 +1295,23 @@ def main() -> int:
                     task=args.task,
                     robot_type=args.robot_type,
                 )
-                with torch.inference_mode():
-                    policy_action_queue_before = _policy_action_queue_size(policy)
-                    action_tensor = policy.select_action(preprocess(frame))
-                    policy_action_queue_after = _policy_action_queue_size(policy)
-                    policy_chunk_refill = (
-                        policy_action_queue_before == 0 and policy_action_queue_after is not None
-                    )
-                    action_tensor = postprocess(action_tensor)
+                with policy_lock:
+                    with torch.inference_mode():
+                        policy_action_queue_before = _policy_action_queue_size(policy)
+                        action_tensor = policy.select_action(preprocess(frame))
+                        policy_action_queue_after = _policy_action_queue_size(policy)
+                        policy_chunk_refill = (
+                            policy_action_queue_before == 0 and policy_action_queue_after is not None
+                        )
+                        action_tensor = postprocess(action_tensor)
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
                 inference_time_ms = (time.monotonic() - inference_start) * 1_000.0
+                action_robot_observation_timestamp_ns = obs.get("timestamp_ns")
+                action_robot_observation_host_time_ns = received_obs.host_time_ns
+                action_robot_observation_age_ms_at_inference = obs_age_ms
 
             action, clamp_info = _clamp_action_with_info(raw_action, args.max_translation_m, args.max_rotation_rad)
+            sequence_id += 1
             _send_action(action_sock, dst, sequence_id, action, enabled=True)
             loop_time_ms = (time.monotonic() - loop_start_mono) * 1_000.0
             _write_jsonl(action_log, {
@@ -927,9 +1319,13 @@ def main() -> int:
                 "sequence_id": sequence_id,
                 "source": "zero_actions" if args.zero_actions else "policy",
                 "task": args.task,
+                "rollout_mode": "zero_actions" if args.zero_actions else args.rollout_mode,
                 "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
                 "robot_observation_host_time_ns": received_obs.host_time_ns,
                 "robot_observation_age_ms": obs_age_ms,
+                "action_robot_observation_timestamp_ns": action_robot_observation_timestamp_ns,
+                "action_robot_observation_host_time_ns": action_robot_observation_host_time_ns,
+                "action_robot_observation_age_ms_at_inference": action_robot_observation_age_ms_at_inference,
                 "max_obs_age_ms": args.max_obs_age_ms,
                 "stale_observation": False,
                 "camera_read_time_ms": camera_read_time_ms,
@@ -938,6 +1334,12 @@ def main() -> int:
                 "policy_action_queue_before": policy_action_queue_before,
                 "policy_action_queue_after": policy_action_queue_after,
                 "policy_chunk_refill": policy_chunk_refill,
+                "async_action_queue_before": async_action_queue_before,
+                "async_action_queue_after": async_action_queue_after,
+                "async_action_age_ms": async_action_age_ms,
+                "async_chunk_sequence_id": async_chunk_sequence_id,
+                "async_chunk_index": async_chunk_index,
+                "async_chunk_size": async_chunk_size,
                 "raw_action": _jsonable_action(raw_action),
                 "clamped_action": _jsonable_action(action),
                 "max_translation_m": args.max_translation_m,
@@ -951,6 +1353,8 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if async_runner is not None:
+            async_runner.stop()
         obs_rx.stop()
         action_sock.close()
         if action_log is not None:
