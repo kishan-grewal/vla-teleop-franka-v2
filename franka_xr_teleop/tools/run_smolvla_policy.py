@@ -442,6 +442,32 @@ def _jsonable_action(action: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
 
 
+def _reset_if_supported(name: str, component: Any) -> str | None:
+    reset = getattr(component, "reset", None)
+    if not callable(reset):
+        return None
+    reset()
+    return name
+
+
+def _reset_policy_runtime(policy: Any, preprocess: Any, postprocess: Any) -> list[str]:
+    reset_components: list[str] = []
+    for name, component in (
+        ("policy", policy),
+        ("preprocess", preprocess),
+        ("postprocess", postprocess),
+    ):
+        reset_name = _reset_if_supported(name, component)
+        if reset_name is not None:
+            reset_components.append(reset_name)
+    return reset_components
+
+
+def _episode_start_active(obs: dict[str, Any]) -> bool:
+    status = obs.get("status", {})
+    return isinstance(status, dict) and bool(status.get("episode_start", False))
+
+
 def _timestamped_preview_dir(root: Path) -> Path:
     return root.expanduser() / datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -623,6 +649,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSONL path for raw/clamped policy actions and clamp metadata.",
     )
+    parser.add_argument(
+        "--no-reset-policy-on-episode-start",
+        action="store_true",
+        help="Do not reset policy/preprocessor state on rising edges of status.episode_start.",
+    )
     parser.add_argument("--max-translation-m", type=float, default=0.015)
     parser.add_argument("--max-rotation-rad", type=float, default=0.10)
     parser.add_argument(
@@ -688,6 +719,17 @@ def main() -> int:
                 policy_path,
                 preprocessor_overrides={"device_processor": {"device": str(device)}},
             )
+            reset_components = _reset_policy_runtime(policy, preprocess, postprocess)
+            if reset_components:
+                print(f"Reset policy runtime state at startup: {', '.join(reset_components)}", flush=True)
+            _write_jsonl(action_log, {
+                "event": "policy_runtime_reset",
+                "reason": "startup",
+                "timestamp_ns": time.monotonic_ns(),
+                "source": "policy",
+                "task": args.task,
+                "reset_components": reset_components,
+            })
             top_hw = _feature_image_shape(policy, TOP_IMAGE_KEY, (args.camera_height, args.camera_width))
             third_hw = _feature_image_shape(policy, THIRD_PERSON_IMAGE_KEY, (args.camera_height, args.camera_width))
             if args.top_camera_backend == "realsense":
@@ -757,6 +799,7 @@ def main() -> int:
 
         sequence_id = 0
         last_stale_warning_mono = 0.0
+        last_episode_start = False
         while True:
             start = time.monotonic()
             loop_start_mono = start
@@ -792,6 +835,31 @@ def main() -> int:
                 continue
 
             obs = received_obs.observation
+            episode_start = _episode_start_active(obs)
+            if (
+                episode_start
+                and not last_episode_start
+                and not args.zero_actions
+                and not args.no_reset_policy_on_episode_start
+            ):
+                reset_components = _reset_policy_runtime(policy, preprocess, postprocess)
+                if reset_components:
+                    print(
+                        f"Reset policy runtime state on episode_start: {', '.join(reset_components)}",
+                        flush=True,
+                    )
+                _write_jsonl(action_log, {
+                    "event": "policy_runtime_reset",
+                    "reason": "episode_start",
+                    "timestamp_ns": time.monotonic_ns(),
+                    "source": "policy",
+                    "task": args.task,
+                    "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                    "robot_observation_host_time_ns": received_obs.host_time_ns,
+                    "robot_observation_age_ms": obs_age_ms,
+                    "reset_components": reset_components,
+                })
+            last_episode_start = episode_start
 
             sequence_id += 1
             camera_read_time_ms: float | None = None
