@@ -28,6 +28,9 @@ EXPECTED_STATE_DIM = 8
 EXPECTED_ACTION_DIM = 7
 SUPPORTED_PYTHON_MIN = (3, 12)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
+EXPOSURE_AUTO_SENTINEL = -1
+EXPOSURE_MIN = 0
+EXPOSURE_MAX = 100
 
 
 def _ensure_supported_python() -> None:
@@ -134,6 +137,56 @@ class ZedLeftCamera:
             if rgb.shape[:2] != (h, w):
                 rgb = self._cv2.resize(rgb, (w, h), interpolation=self._cv2.INTER_AREA)
         return rgb
+
+    
+    def configure_exposure(self, args: argparse.Namespace) -> Optional[int]:
+        want_auto_exposure = args.auto_exposure or args.exposure == EXPOSURE_AUTO_SENTINEL
+        if want_auto_exposure:
+            err = self._zed.set_camera_settings(self._sl.VIDEO_SETTINGS.AEC_AGC, 1)
+            if err != self._sl.ERROR_CODE.SUCCESS:
+                raise RuntimeError(f"Failed to enable ZED auto exposure: {err}")
+            err = self._zed.set_camera_settings(self._sl.VIDEO_SETTINGS.EXPOSURE, EXPOSURE_AUTO_SENTINEL)
+            if err != self._sl.ERROR_CODE.SUCCESS:
+                raise RuntimeError(f"Failed to reset ZED exposure to auto: {err}")
+            aec_agc = get_camera_setting(self._zed, self._sl, self._sl.VIDEO_SETTINGS.AEC_AGC, "AEC_AGC state")
+            if aec_agc != 1:
+                raise RuntimeError(f"Requested ZED auto exposure, but camera reported AEC_AGC={aec_agc}")
+            exposure = get_camera_setting(self._zed, self._sl, self._sl.VIDEO_SETTINGS.EXPOSURE, "exposure after enabling auto mode")
+            return exposure
+
+        if args.exposure is None:
+            return None
+
+        if not EXPOSURE_MIN <= args.exposure <= EXPOSURE_MAX:
+            raise ValueError(
+                "--exposure must be -1 for auto exposure, or within the ZED SDK "
+                f"documented manual range [{EXPOSURE_MIN}, {EXPOSURE_MAX}]; got {args.exposure}"
+            )
+
+        err = self._zed.set_camera_settings(self._sl.VIDEO_SETTINGS.AEC_AGC, 0)
+        if err != self._sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to disable ZED auto exposure before manual exposure set: {err}")
+        err = self._zed.set_camera_settings(self._sl.VIDEO_SETTINGS.EXPOSURE, args.exposure)
+        if err != self._sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to set ZED exposure to {args.exposure}: {err}")
+
+        aec_agc = self.get_camera_setting(self._sl.VIDEO_SETTINGS.AEC_AGC, "AEC_AGC state")
+        if aec_agc != 0:
+            raise RuntimeError(
+                f"Requested manual ZED exposure {args.exposure}, but camera reported AEC_AGC={aec_agc}"
+            )
+        exposure = self.get_camera_setting(self._sl.VIDEO_SETTINGS.EXPOSURE, "exposure after setting it")
+        if exposure != args.exposure:
+            raise RuntimeError(
+                f"Requested ZED exposure {args.exposure}, but camera reported exposure {exposure}"
+            )
+        return exposure
+
+    def get_camera_setting(self, setting: Any, label: str) -> int:
+        read_err, value = self._zed.get_camera_settings(setting)
+        if read_err != self._sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to read ZED {label}: {read_err}")
+        return value
 
     def close(self) -> None:
         self._zed.close()
@@ -614,6 +667,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send enabled zero actions without loading SmolVLA; useful for bridge smoke tests.",
     )
+    parser.add_argument("--exposure", type=int, default=60, help="ZED camera exposure to set manually.")
+    parser.add_argument("--auto-exposure", action="store_true", help="Enable ZED auto exposure.")
     return parser.parse_args()
 
 
@@ -681,6 +736,7 @@ def main() -> int:
                 )
             else:
                 top_camera = ZedLeftCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
+                top_camera.configure_exposure(args)
             if args.third_person_camera_backend == "realsense":
                 third_person_camera = RealSenseColorCamera(
                     args.realsense_serial,
@@ -690,6 +746,7 @@ def main() -> int:
                 )
             else:
                 third_person_camera = ZedLeftCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
+                third_person_camera.configure_exposure(args)
             preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
             top_preview = _capture_startup_preview(
                 top_camera,
