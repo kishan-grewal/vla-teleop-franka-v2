@@ -154,10 +154,18 @@ def build_zed_command(
     force_svo: bool,
     force_depth: bool,
 ) -> List[str]:
+    if cfg.get("exposure") not in (None, -1) and bool_value(cfg, "auto_exposure", False):
+        raise ValueError("config.zed.exposure and config.zed.auto_exposure cannot both be set")
     cmd = [str(script_dir() / "record_zed_camera.py")]
     camera_name = cfg.get("camera_name", "ee_zed_m")
+    left_camera_name = cfg.get("left_camera_name", f"{camera_name}_left")
+    right_camera_name = cfg.get("right_camera_name", f"{camera_name}_right")
     add_option(cmd, "--camera-name", camera_name)
     add_option(cmd, "--output-dir", session_dir / "cameras" / str(camera_name))
+    add_option(cmd, "--left-camera-name", left_camera_name)
+    add_option(cmd, "--right-camera-name", right_camera_name)
+    add_option(cmd, "--left-output-dir", session_dir / "cameras" / str(left_camera_name))
+    add_option(cmd, "--right-output-dir", session_dir / "cameras" / str(right_camera_name))
     add_option(cmd, "--serial", zed_serial if zed_serial is not None else cfg.get("serial", 0))
     add_option(cmd, "--resolution", cfg.get("resolution", "HD720"))
     add_option(cmd, "--fps", cfg.get("fps", 30))
@@ -167,6 +175,8 @@ def build_zed_command(
     add_option(cmd, "--svo-compression", cfg.get("svo_compression", "H264"))
     add_option(cmd, "--video-codec", cfg.get("video_codec", "mp4v"))
     add_option(cmd, "--print-hz", cfg.get("print_hz", 1.0))
+    add_option(cmd, "--exposure", cfg.get("exposure"))
+    add_flag(cmd, bool_value(cfg, "auto_exposure", False), "--auto-exposure")
     add_flag(cmd, bool_value(cfg, "svo", False) or force_svo, "--svo")
     add_flag(cmd, bool_value(cfg, "depth", False) or force_depth, "--depth")
     return cmd

@@ -271,7 +271,7 @@ bool SolveIkStep(const franka::Model& model,
   std::array<double, 7> q_next = snapshot.q_d;
   Pose tcp_pose_next = snapshot.tcp_pose_d;
   const Eigen::Matrix<double, 7, 1> q_nullspace_target = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(
-    config.ik.nullspace_joint_positions_rad.data());
+      config.ik.nullspace_joint_positions_rad.data());
   const double dt = 1.0 / config.teleop.planner_rate_hz;
   const double max_step_by_velocity = config.ik.max_joint_velocity_radps * dt;
   const double max_step = std::min(config.ik.max_joint_step_rad, max_step_by_velocity);

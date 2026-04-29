@@ -12,11 +12,15 @@ robot:
 zed:
   enabled: true
   camera_name: ee_zed_m
+  left_camera_name: ee_zed_m_left
+  right_camera_name: ee_zed_m_right
   serial: 0
   resolution: HD720
   fps: 30
   width: 0
   height: 0
+  exposure: 70
+  auto_exposure: false
   svo: false
   svo_compression: H264
   depth: false

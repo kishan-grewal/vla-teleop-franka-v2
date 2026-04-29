@@ -146,8 +146,8 @@ bool LoadTeleopConfig(const std::string& path, AppConfig* config, std::string* e
     ReadScalar(ik, "damping", &config->bridge.ik.damping);
     ReadScalar(ik, "nullspace_gain", &config->bridge.ik.nullspace_gain);
     ReadArray(ik,
-      "nullspace_joint_positions_rad",
-      &config->bridge.ik.nullspace_joint_positions_rad);
+              "nullspace_joint_positions_rad",
+              &config->bridge.ik.nullspace_joint_positions_rad);
     ReadScalar(ik, "planner_substeps", &config->bridge.ik.planner_substeps);
     ReadScalar(ik, "max_joint_velocity_radps", &config->bridge.ik.max_joint_velocity_radps);
     ReadScalar(ik, "max_joint_acceleration_radps2", &config->bridge.ik.max_joint_acceleration_radps2);

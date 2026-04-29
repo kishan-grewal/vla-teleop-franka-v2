@@ -5,7 +5,7 @@ xr_frame:
     - [-1.0, 0.0, 0.0]
     - [0.0, 1.0, 0.0]
   orientation_rotation_matrix_row_major:
-    #- [0.0, 1.0, 0.0]
+    #- [0.0, 1.0, 0.0] Old mapping for local frame pose control (robot_q * delta_q rather than the other way around)
     #- [1.0, 0.0, 0.0]
     #- [0.0, 0.0, -1.0]
     - [0.0, 0.0, -1.0]

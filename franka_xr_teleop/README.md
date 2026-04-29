@@ -204,17 +204,19 @@ Record the end-effector ZED/ZED-M camera on the same host:
   --svo
 ```
 
-This writes `rgb.mp4` for convenient playback/classification, `frames.jsonl`
-with one host monotonic timestamp per frame, and optionally `raw.svo` for ZED
-SDK playback or later re-extraction. Use `--depth` if metric depth should also
-be saved as per-frame compressed arrays.
+This writes two virtual camera directories, `ee_zed_m_left/` and
+`ee_zed_m_right/`, each with its own `rgb.mp4`, `frames.jsonl`, and
+`metadata.json`. If `--svo` is enabled, the shared stereo SVO is kept under
+`ee_zed_m/raw.svo`. Use `--depth` if metric depth should also be saved for the
+left virtual camera.
 
 Align robot observations to camera frames after recording:
 
 ```bash
 ./tools/align_robot_camera_jsonl.py \
   --robot-jsonl recordings/session_001/robot.jsonl \
-  --camera ee_zed_m recordings/session_001/cameras/ee_zed_m/frames.jsonl \
+  --camera ee_zed_m_left recordings/session_001/cameras/ee_zed_m_left/frames.jsonl \
+  --camera ee_zed_m_right recordings/session_001/cameras/ee_zed_m_right/frames.jsonl \
   --output recordings/session_001/aligned_samples.jsonl
 ```
 

@@ -13,11 +13,16 @@ recordings/session_001/
   aligned_samples.jsonl
   cameras/
     ee_zed_m/
+      raw.svo          # optional shared ZED stereo asset
+    ee_zed_m_left/
       rgb.mp4
       frames.jsonl
       metadata.json
-      raw.svo          # optional
-      depth/           # optional
+      depth/           # optional, left-view depth only
+    ee_zed_m_right/
+      rgb.mp4
+      frames.jsonl
+      metadata.json
     third_person_d405/
       rgb.mp4
       frames.jsonl
@@ -26,8 +31,9 @@ recordings/session_001/
       depth/           # optional
 ```
 
-`rgb.mp4` is intended for convenient playback and data classification.
-`raw.svo` is optional, but useful as a ZED SDK backup for later re-extraction.
+`ee_zed_m_left/rgb.mp4` and `ee_zed_m_right/rgb.mp4` are the two synchronized
+views of the stereo pair. `cameras/ee_zed_m/raw.svo` is optional, but useful as
+a ZED SDK backup for later re-extraction.
 
 ## Clock Sync
 
@@ -132,12 +138,22 @@ Record the wrist/end-effector camera:
 
 Outputs:
 
-- `rgb.mp4`: compressed RGB video for playback and labeling.
-- `frames.jsonl`: one row per frame with `host_timestamp_ns` and video frame
-index.
-- `metadata.json`: camera metadata and calibration fields.
-- `raw.svo`: optional ZED raw recording when `--svo` is enabled.
-- `depth/`: optional metric depth frames when `--depth` is enabled.
+- `../ee_zed_m_left/rgb.mp4`: compressed left-eye RGB video for playback and
+  labeling.
+- `../ee_zed_m_left/frames.jsonl`: one row per left-eye frame with
+  `host_timestamp_ns`.
+- `../ee_zed_m_left/metadata.json`: left virtual camera metadata and
+  calibration fields.
+- `../ee_zed_m_right/rgb.mp4`: compressed right-eye RGB video for playback and
+  labeling.
+- `../ee_zed_m_right/frames.jsonl`: one row per right-eye frame with the same
+  synchronized timestamps and frame indices as the left view.
+- `../ee_zed_m_right/metadata.json`: right virtual camera metadata and
+  calibration fields.
+- `raw.svo`: optional shared ZED raw recording under `cameras/ee_zed_m/` when
+  `--svo` is enabled.
+- `../ee_zed_m_left/depth/`: optional metric depth frames aligned to the left
+  virtual camera when `--depth` is enabled.
 
 Useful flags:
 
@@ -148,7 +164,8 @@ Useful flags:
 - `--duration-s 60`: stop after a fixed duration.
 - `--max-frames N`: stop after a fixed number of frames.
 
-For labeling/classification, use `rgb.mp4`. Keep `raw.svo` in parallel when you
+For labeling/classification, use `ee_zed_m_left/rgb.mp4` and/or
+`ee_zed_m_right/rgb.mp4`. Keep `cameras/ee_zed_m/raw.svo` in parallel when you
 want the option to re-extract frames, depth, or rectified streams later.
 
 ## Record The Third-Person RealSense D405
@@ -194,7 +211,8 @@ After recording, build aligned training samples:
 ```bash
 ./tools/align_robot_camera_jsonl.py \
   --robot-jsonl recordings/session_001/robot.jsonl \
-  --camera ee_zed_m recordings/session_001/cameras/ee_zed_m/frames.jsonl \
+  --camera ee_zed_m_left recordings/session_001/cameras/ee_zed_m_left/frames.jsonl \
+  --camera ee_zed_m_right recordings/session_001/cameras/ee_zed_m_right/frames.jsonl \
   --camera third_person_d405 recordings/session_001/cameras/third_person_d405/frames.jsonl \
   --output recordings/session_001/aligned_samples.jsonl
 ```
@@ -215,7 +233,14 @@ Each output row contains:
   "timestamp_ns": 123,
   "robot": {},
   "cameras": {
-    "ee_zed_m": {
+    "ee_zed_m_left": {
+      "dt_ns": -5000000,
+      "frame": {
+        "rgb_video": "rgb.mp4",
+        "rgb_video_frame": 42
+      }
+    },
+    "ee_zed_m_right": {
       "dt_ns": -5000000,
       "frame": {
         "rgb_video": "rgb.mp4",
@@ -238,7 +263,8 @@ robot TCP pose and camera observations.
 
 For multiple cameras, use stable names such as:
 
-- `ee_zed_m`
+- `ee_zed_m_left`
+- `ee_zed_m_right`
 - `third_person_d405`
 - `front_zed`
 - `side_zed`
@@ -249,7 +275,8 @@ Then pass each camera to the aligner:
 ```bash
 ./tools/align_robot_camera_jsonl.py \
   --robot-jsonl recordings/session_001/robot.jsonl \
-  --camera ee_zed_m recordings/session_001/cameras/ee_zed_m/frames.jsonl \
+  --camera ee_zed_m_left recordings/session_001/cameras/ee_zed_m_left/frames.jsonl \
+  --camera ee_zed_m_right recordings/session_001/cameras/ee_zed_m_right/frames.jsonl \
   --camera third_person_d405 recordings/session_001/cameras/third_person_d405/frames.jsonl \
   --output recordings/session_001/aligned_samples.jsonl
 ```
