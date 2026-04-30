@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a SmolVLA policy and stream 7D Cartesian actions to the Franka bridge."""
+"""Run a LeRobot policy (SmolVLA, ACT, or Pi0) and stream 7D Cartesian actions to the Franka bridge."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, TextIO
+from typing import Any, Callable, Optional, TextIO
 
 import numpy as np
 
@@ -36,6 +36,32 @@ EXPOSURE_MIN = 0
 EXPOSURE_MAX = 100
 REHOME_REQUEST_REPEAT_PACKETS = 10
 
+
+def _load_smolvla_policy_class() -> Any:
+    from lerobot.policies.smolvla import SmolVLAPolicy
+    return SmolVLAPolicy
+
+
+def _load_act_policy_class() -> Any:
+    from lerobot.policies.act import ACTPolicy
+    return ACTPolicy
+
+
+def _load_pi0_policy_class() -> Any:
+    from lerobot.policies.pi0 import PI0Policy
+    return PI0Policy
+
+
+# Registry of supported policy types. The value is a thin loader so the heavy
+# imports happen only when the user actually picks that policy. Add new
+# policies here (e.g. pi0fast, pi05) and they Just Work end-to-end.
+POLICY_REGISTRY: dict[str, Callable[[], Any]] = {
+    "smolvla": _load_smolvla_policy_class,
+    "act": _load_act_policy_class,
+    "pi0": _load_pi0_policy_class,
+}
+
+
 with contextlib.suppress(ImportError):
     import termios
     import tty
@@ -56,7 +82,7 @@ def _ensure_supported_python() -> None:
     min_supported = ".".join(str(v) for v in SUPPORTED_PYTHON_MIN)
     max_supported = ".".join(str(v) for v in (3, 13))
     raise RuntimeError(
-        "run_smolvla_policy.py must be run with Python "
+        "run_lerobot_policy.py must be run with Python "
         f"{min_supported}-{max_supported}. Current interpreter: {current} "
         f"({sys.executable}). "
         "This local lerobot checkout uses draccus config parsing that is not "
@@ -140,6 +166,7 @@ class KeyboardMonitor:
                 raise KeyboardInterrupt
             chars.append(ch)
         return chars
+
 
 class ZedStereoCamera:
     def __init__(self, serial: int, resolution: str, fps: int) -> None:
@@ -724,10 +751,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List available RealSense and ZED devices with serials, then exit.",
     )
+    parser.add_argument(
+        "--policy-type",
+        choices=sorted(POLICY_REGISTRY),
+        default="smolvla",
+        help=(
+            "LeRobot policy class to load. 'smolvla' and 'act' ship with the base "
+            "lerobot install; 'pi0' requires the [pi] extra."
+        ),
+    )
     parser.add_argument("--policy-path", type=Path, default=None)
     parser.add_argument("--lerobot-root", type=Path, default=None)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--task", default="")
+    parser.add_argument(
+        "--task",
+        default="",
+        help=(
+            "Natural-language task string. Used by VLA models (smolvla, pi0); "
+            "ignored by ACT."
+        ),
+    )
     parser.add_argument("--robot-type", default="franka")
     parser.add_argument("--obs-bind-ip", default="0.0.0.0")
     parser.add_argument("--obs-port", type=int, default=28081)
@@ -799,7 +842,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--zero-actions",
         action="store_true",
-        help="Send enabled zero actions without loading SmolVLA; useful for bridge smoke tests.",
+        help="Send enabled zero actions without loading any policy; useful for bridge smoke tests.",
     )
     parser.add_argument("--exposure", type=int, default=60, help="ZED camera exposure to set manually.")
     parser.add_argument("--auto-exposure", action="store_true", help="Enable ZED auto exposure.")
@@ -846,12 +889,32 @@ def main() -> int:
             _ensure_lerobot_importable(_resolve_lerobot_root(args.lerobot_root))
             import torch
             from lerobot.policies import make_pre_post_processors
-            from lerobot.policies.smolvla import SmolVLAPolicy
             from lerobot.policies.utils import prepare_observation_for_inference
+
+            try:
+                policy_class_loader = POLICY_REGISTRY[args.policy_type]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unknown --policy-type {args.policy_type!r}; choose from "
+                    f"{sorted(POLICY_REGISTRY)}"
+                ) from exc
+            try:
+                policy_class = policy_class_loader()
+            except ImportError as exc:
+                hint = ""
+                if args.policy_type == "pi0":
+                    hint = (
+                        " Install Pi0 dependencies first, e.g. "
+                        "'uv pip install -e \".[pi]\"' inside the lerobot venv."
+                    )
+                raise ImportError(
+                    f"Failed to import policy class for --policy-type "
+                    f"{args.policy_type!r}: {exc}.{hint}"
+                ) from exc
 
             device = torch.device(args.device)
             policy_path = str(_resolve_policy_path(args.policy_path))
-            policy = SmolVLAPolicy.from_pretrained(policy_path)
+            policy = policy_class.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
             image_keys = (TOP_IMAGE_KEY, RIGHT_ZED_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
@@ -942,6 +1005,7 @@ def main() -> int:
                 manifest_path.write_text(
                     json.dumps(
                         {
+                            "policy_type": args.policy_type,
                             "policy_path": policy_path,
                             "task": args.task,
                             "policy_features": policy_features,
@@ -954,7 +1018,10 @@ def main() -> int:
                     encoding="utf-8",
                 )
                 print(f"Saved camera preview manifest to {manifest_path}", flush=True)
-            print(f"Loaded SmolVLA policy from {policy_path}", flush=True)
+            print(
+                f"Loaded {args.policy_type} policy ({policy_class.__name__}) from {policy_path}",
+                flush=True,
+            )
         else:
             torch = None
             prepare_observation_for_inference = None
@@ -1063,6 +1130,7 @@ def main() -> int:
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
                 "source": "zero_actions" if args.zero_actions else "policy",
+                "policy_type": None if args.zero_actions else args.policy_type,
                 "task": args.task,
                 "robot_observation_timestamp_ns": None if obs is None else obs.get("timestamp_ns"),
                 "enabled": enabled,
