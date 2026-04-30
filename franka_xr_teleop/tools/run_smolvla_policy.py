@@ -794,8 +794,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSONL path for raw/clamped policy actions and clamp metadata.",
     )
-    parser.add_argument("--max-translation-m", type=float, default=0.015)
-    parser.add_argument("--max-rotation-rad", type=float, default=0.10)
+    parser.add_argument("--max-translation-m", type=float, default=0.030)
+    parser.add_argument("--max-rotation-rad", type=float, default=0.20)
     parser.add_argument(
         "--zero-actions",
         action="store_true",
