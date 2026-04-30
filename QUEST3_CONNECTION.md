@@ -21,26 +21,30 @@ adb devices
 ```
 
 Then put on the headset and accept:
+
 - `Allow USB debugging?`
 - Check `Always allow from this computer`.
 
 Expected `adb devices` state:
+
 - Quest device appears as `device` (not `unauthorized`).
 
 ## 3) If `adb devices` shows no devices
 
 Symptom:
+
 - `adb devices` returns an empty list.
 - `adb reverse ...` fails with `error: no devices/emulators found`.
 
 Steps:
 
 1. Reconnect with a known USB data path:
+
 - Keep Quest powered on and unlocked.
 - Replug USB directly to laptop (avoid hubs/docks during debugging).
 - Try a different USB port and a known data-capable cable (not charge-only).
 
-2. Re-check device detection:
+1. Re-check device detection:
 
 ```bash
 adb kill-server
@@ -48,24 +52,27 @@ adb start-server
 adb devices -l
 ```
 
-3. Confirm Linux sees Quest on USB:
+1. Confirm Linux sees Quest on USB:
 
 ```bash
 lsusb | grep -Ei 'meta|oculus|android|quest'
 ```
 
 Interpretation:
+
 - If `lsusb` shows nothing relevant, this is a cable/port/USB-path issue.
 - If `lsusb` shows Quest but `adb devices` is still empty, continue with authorization reset in the next section.
 
 ### 3.1) If `lsusb` sees Quest but `adb devices -l` is empty (common after replug)
 
 Symptom:
+
 - `lsusb` shows `ID 2833:0183 Oculus Quest 3`.
 - `adb devices -l` is empty.
 - You checked `/dev/bus/usb/<bus>/<dev>` and it did not exist.
 
 Note:
+
 - The USB device number can change after reconnect. Re-check current `BUS/DEV` every time.
 
 Get current device node dynamically:
@@ -89,6 +96,7 @@ adb devices -l
 ```
 
 On Quest:
+
 - Wear headset and keep it unlocked on Home.
 - `Settings -> System -> Developer`.
 - `Revoke USB debugging authorizations`.
@@ -123,10 +131,11 @@ adb devices -l
 ## 4) If `adb devices` shows `unauthorized`
 
 1. On Quest 3:
+
 - Go to `Settings -> System -> Developer`.
 - Select `Revoke USB debugging authorizations`.
 
-2. Reconnect USB and restart ADB:
+1. Reconnect USB and restart ADB:
 
 ```bash
 adb kill-server
@@ -134,7 +143,7 @@ adb start-server
 adb devices
 ```
 
-3. If still unauthorized, regenerate host ADB keys:
+1. If still unauthorized, regenerate host ADB keys:
 
 ```bash
 rm -f ~/.android/adbkey ~/.android/adbkey.pub
@@ -156,6 +165,7 @@ adb reverse --list
 ```
 
 Expected:
+
 - `adb reverse --list` includes `tcp:63901 tcp:63901`.
 
 In the Quest app, connect to:
@@ -185,3 +195,4 @@ cd /home/radu/vla-teleop-franka-v2/franka_xr_teleop
 - `adb reverse --list` shows `tcp:63901 tcp:63901`.
 - Quest app connects to `127.0.0.1`.
 - Bridge logs show incoming XR/controller data.
+

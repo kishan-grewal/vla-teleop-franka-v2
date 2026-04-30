@@ -11,7 +11,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Optional, TextIO
 
 import numpy as np
 
@@ -22,10 +22,11 @@ from record_zed_camera import timestamp_to_ns as zed_timestamp_to_ns
 
 OBS_STATE_KEY = "observation.state"
 TOP_IMAGE_KEY = "observation.images.top"
+RIGHT_ZED_IMAGE_KEY = "observation.images.ee_zed_m_right"
 THIRD_PERSON_IMAGE_KEY = "observation.images.third_person_d405"
 ACTION_KEY = "action"
-EXPECTED_STATE_DIM = 8
 EXPECTED_ACTION_DIM = 7
+SUPPORTED_STATE_DIMS = (8, 22)
 SUPPORTED_PYTHON_MIN = (3, 12)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
 EXPOSURE_AUTO_SENTINEL = -1
@@ -89,13 +90,14 @@ class LatestRobotObservation:
                 with self._lock:
                     self._latest = obs
 
-class ZedLeftCamera:
+class ZedStereoCamera:
     def __init__(self, serial: int, resolution: str, fps: int) -> None:
         cv2, _np, sl = import_zed_dependencies()
         self._cv2 = cv2
         self._sl = sl
         self._zed = sl.Camera()
-        self._image = sl.Mat()
+        self._left_image = sl.Mat()
+        self._right_image = sl.Mat()
         self._runtime = sl.RuntimeParameters()
 
         init = sl.InitParameters()
@@ -111,7 +113,7 @@ class ZedLeftCamera:
             raise RuntimeError(f"Failed to open ZED camera: {err}")
 
         info = self._zed.get_camera_information()
-        self.source = f"zed-left(serial={getattr(info, 'serial_number', serial or 'first')})"
+        self.source = f"zed-stereo(serial={getattr(info, 'serial_number', serial or 'first')})"
         self._reported_width = None
         self._reported_height = None
         self._reported_fps = float(fps)
@@ -124,21 +126,34 @@ class ZedLeftCamera:
         self._model = str(getattr(info, "camera_model", ""))
         self._last_timestamp_ns: int | None = None
 
-    def read_rgb(self, target_hw: tuple[int, int] | None = None) -> np.ndarray:
+    def _resize_rgb(self, rgb: np.ndarray, target_hw: tuple[int, int] | None) -> np.ndarray:
+        if target_hw is None:
+            return rgb
+        h, w = target_hw
+        if rgb.shape[:2] == (h, w):
+            return rgb
+        return self._cv2.resize(rgb, (w, h), interpolation=self._cv2.INTER_AREA)
+
+    def read_views_rgb(self, *requests: tuple[str, tuple[int, int] | None]) -> list[np.ndarray]:
         err = self._zed.grab(self._runtime)
         if err != self._sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(f"ZED grab failed: {err}")
-        self._zed.retrieve_image(self._image, self._sl.VIEW.LEFT)
+        self._zed.retrieve_image(self._left_image, self._sl.VIEW.LEFT)
+        self._zed.retrieve_image(self._right_image, self._sl.VIEW.RIGHT)
         self._last_timestamp_ns = zed_timestamp_to_ns(self._zed.get_timestamp(self._sl.TIME_REFERENCE.IMAGE))
-        bgra = self._image.get_data()
-        rgb = self._cv2.cvtColor(bgra, self._cv2.COLOR_BGRA2RGB)
-        if target_hw is not None:
-            h, w = target_hw
-            if rgb.shape[:2] != (h, w):
-                rgb = self._cv2.resize(rgb, (w, h), interpolation=self._cv2.INTER_AREA)
-        return rgb
+        left_rgb = self._cv2.cvtColor(self._left_image.get_data(), self._cv2.COLOR_BGRA2RGB)
+        right_rgb = self._cv2.cvtColor(self._right_image.get_data(), self._cv2.COLOR_BGRA2RGB)
 
-    
+        outputs: list[np.ndarray] = []
+        for view, target_hw in requests:
+            if view == "left":
+                outputs.append(self._resize_rgb(left_rgb, target_hw))
+            elif view == "right":
+                outputs.append(self._resize_rgb(right_rgb, target_hw))
+            else:
+                raise ValueError(f"Unsupported ZED view {view!r}; expected 'left' or 'right'")
+        return outputs
+
     def configure_exposure(self, args: argparse.Namespace) -> Optional[int]:
         want_auto_exposure = args.auto_exposure or args.exposure == EXPOSURE_AUTO_SENTINEL
         if want_auto_exposure:
@@ -148,10 +163,10 @@ class ZedLeftCamera:
             err = self._zed.set_camera_settings(self._sl.VIDEO_SETTINGS.EXPOSURE, EXPOSURE_AUTO_SENTINEL)
             if err != self._sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"Failed to reset ZED exposure to auto: {err}")
-            aec_agc = get_camera_setting(self._zed, self._sl, self._sl.VIDEO_SETTINGS.AEC_AGC, "AEC_AGC state")
+            aec_agc = self.get_camera_setting(self._sl.VIDEO_SETTINGS.AEC_AGC, "AEC_AGC state")
             if aec_agc != 1:
                 raise RuntimeError(f"Requested ZED auto exposure, but camera reported AEC_AGC={aec_agc}")
-            exposure = get_camera_setting(self._zed, self._sl, self._sl.VIDEO_SETTINGS.EXPOSURE, "exposure after enabling auto mode")
+            exposure = self.get_camera_setting(self._sl.VIDEO_SETTINGS.EXPOSURE, "exposure after enabling auto mode")
             return exposure
 
         if args.exposure is None:
@@ -191,9 +206,11 @@ class ZedLeftCamera:
     def close(self) -> None:
         self._zed.close()
 
-    def properties(self) -> dict[str, Any]:
+    def properties(self, view: str) -> dict[str, Any]:
+        if view not in {"left", "right"}:
+            raise ValueError(f"Unsupported ZED view {view!r}; expected 'left' or 'right'")
         return {
-            "source": self.source,
+            "source": f"{self.source}:{view}",
             "backend": "pyzed.sl",
             "reported_width": float(self._reported_width or 0),
             "reported_height": float(self._reported_height or 0),
@@ -201,7 +218,7 @@ class ZedLeftCamera:
             "fourcc": "BGRA",
             "serial_number": self._serial,
             "camera_model": self._model,
-            "zed_view": "LEFT",
+            "zed_view": view.upper(),
             "zed_timestamp_ns": self._last_timestamp_ns,
         }
 
@@ -305,13 +322,37 @@ def _resolve_policy_path(path: Path) -> Path:
     )
 
 
-def _robot_state_vector(obs: dict[str, Any]) -> np.ndarray:
+def _robot_state_vector(obs: dict[str, Any], expected_dim: int) -> np.ndarray:
     state = obs.get("robot_state", {})
     q = state.get("q", [])
     if len(q) != 7:
         raise ValueError("robot_state.q must contain 7 joints")
+    dq = state.get("dq", [])
+    if expected_dim == 22 and len(dq) != 7:
+        raise ValueError("robot_state.dq must contain 7 joint velocities for 22D state models")
+    tcp_position = state.get("tcp_position_xyz", [])
+    if expected_dim == 22 and len(tcp_position) != 3:
+        raise ValueError("robot_state.tcp_position_xyz must contain 3 values for 22D state models")
+    tcp_orientation = state.get("tcp_orientation_xyzw", [])
+    if expected_dim == 22 and len(tcp_orientation) != 4:
+        raise ValueError("robot_state.tcp_orientation_xyzw must contain 4 values for 22D state models")
     gripper_width = float(state.get("gripper_width", 0.0))
-    return np.asarray([*map(float, q), gripper_width], dtype=np.float32)
+    if expected_dim == 8:
+        values = [*map(float, q), gripper_width]
+    elif expected_dim == 22:
+        values = [
+            *map(float, q),
+            *map(float, dq),
+            *map(float, tcp_position),
+            *map(float, tcp_orientation),
+            gripper_width,
+        ]
+    else:
+        raise ValueError(
+            f"Unsupported policy state dimension {expected_dim}; "
+            f"runner currently supports {list(SUPPORTED_STATE_DIMS)}"
+        )
+    return np.asarray(values, dtype=np.float32)
 
 
 def _feature_shape(feature: Any) -> tuple[int, ...] | None:
@@ -351,9 +392,12 @@ def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_fu
     state_shape = _feature_shape(input_features.get(OBS_STATE_KEY))
     if OBS_STATE_KEY not in input_features:
         errors.append(f"missing required input feature {OBS_STATE_KEY!r}")
-    elif state_shape != (EXPECTED_STATE_DIM,):
+    elif state_shape is None or len(state_shape) != 1:
+        errors.append(f"{OBS_STATE_KEY!r} must have shape [D], got {list(state_shape or [])}")
+    elif state_shape[0] not in SUPPORTED_STATE_DIMS:
         errors.append(
-            f"{OBS_STATE_KEY!r} must have shape [{EXPECTED_STATE_DIM}], got {list(state_shape or [])}"
+            f"{OBS_STATE_KEY!r} must have one of the supported dimensions "
+            f"{list(SUPPORTED_STATE_DIMS)}, got {list(state_shape)}"
         )
 
     for key in image_keys:
@@ -387,7 +431,7 @@ def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_fu
         "input_features": _feature_summary(input_features),
         "output_features": _feature_summary(output_features),
         "live_observation_keys": [OBS_STATE_KEY, *image_keys],
-        "expected_state_dim": EXPECTED_STATE_DIM,
+        "expected_state_dim": state_shape[0] if state_shape else None,
         "expected_action_dim": EXPECTED_ACTION_DIM,
         "image_features": sorted(image_features),
     }
@@ -543,6 +587,36 @@ def _capture_startup_preview(
     }
 
 
+def _preview_summary_from_image(
+    properties: dict[str, Any],
+    policy_key: str,
+    target_hw: tuple[int, int],
+    sample_count: int,
+    elapsed_s: float,
+    image: np.ndarray,
+    output_dir: Path | None,
+) -> dict[str, Any]:
+    preview_path: str | None = None
+    if output_dir is not None:
+        safe_key = policy_key.replace(".", "_")
+        path = output_dir / f"{safe_key}.png"
+        _save_preview_frame(path, image, f"{policy_key} source={properties['source']}")
+        preview_path = str(path)
+
+    return {
+        **properties,
+        "policy_key": policy_key,
+        "target_height": int(target_hw[0]),
+        "target_width": int(target_hw[1]),
+        "observed_height": int(image.shape[0]),
+        "observed_width": int(image.shape[1]),
+        "observed_channels": int(image.shape[2]) if image.ndim == 3 else 1,
+        "read_samples": sample_count,
+        "observed_read_fps": sample_count / max(elapsed_s, 1e-9),
+        "preview_path": preview_path,
+    }
+
+
 def _print_camera_summary(summary: dict[str, Any]) -> None:
     print(
         "Camera identity: "
@@ -605,17 +679,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rate-hz", type=float, default=30.0)
     parser.add_argument(
         "--top-camera-backend",
-        choices=["realsense", "zed-left"],
-        default="realsense",
-        help="SDK-backed source for observation.images.top.",
+        choices=["zed-left"],
+        default="zed-left",
+        help=(
+            "SDK-backed source for observation.images.top. Future models assume "
+            "this is the left-eye view from the wrist ZED stereo pair."
+        ),
     )
     parser.add_argument(
         "--third-person-camera-backend",
         choices=["realsense", "zed-left"],
-        default="zed-left",
+        default="realsense",
         help=(
             "SDK-backed source for observation.images.third_person_d405. "
-            "TODO: revisit these defaults and names once policy camera conventions are cleaned up."
+            "Newer checkpoints are expected to use the actual third-person D405 path here."
         ),
     )
     parser.add_argument("--zed-serial", type=int, default=0, help="ZED serial number; 0 uses the first camera.")
@@ -697,7 +774,8 @@ def main() -> int:
     policy = None
     preprocess = None
     postprocess = None
-    top_camera = None
+    policy_state_dim = None
+    zed_camera = None
     third_person_camera = None
     action_log: TextIO | None = None
 
@@ -718,25 +796,22 @@ def main() -> int:
             policy = SmolVLAPolicy.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
-            image_keys = (TOP_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
+            image_keys = (TOP_IMAGE_KEY, RIGHT_ZED_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
             policy_features = _validate_policy_features(policy, image_keys, args.print_policy_features)
+            state_shape = _feature_shape(policy.config.input_features.get(OBS_STATE_KEY))
+            if state_shape is None or len(state_shape) != 1:
+                raise ValueError(f"Could not determine state dimension for {OBS_STATE_KEY!r}")
+            policy_state_dim = int(state_shape[0])
             preprocess, postprocess = make_pre_post_processors(
                 policy.config,
                 policy_path,
                 preprocessor_overrides={"device_processor": {"device": str(device)}},
             )
             top_hw = _feature_image_shape(policy, TOP_IMAGE_KEY, (args.camera_height, args.camera_width))
+            right_hw = _feature_image_shape(policy, RIGHT_ZED_IMAGE_KEY, (args.camera_height, args.camera_width))
             third_hw = _feature_image_shape(policy, THIRD_PERSON_IMAGE_KEY, (args.camera_height, args.camera_width))
-            if args.top_camera_backend == "realsense":
-                top_camera = RealSenseColorCamera(
-                    args.realsense_serial,
-                    args.realsense_color_width,
-                    args.realsense_color_height,
-                    args.realsense_fps,
-                )
-            else:
-                top_camera = ZedLeftCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
-                top_camera.configure_exposure(args)
+            zed_camera = ZedStereoCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
+            zed_camera.configure_exposure(args)
             if args.third_person_camera_backend == "realsense":
                 third_person_camera = RealSenseColorCamera(
                     args.realsense_serial,
@@ -744,25 +819,65 @@ def main() -> int:
                     args.realsense_color_height,
                     args.realsense_fps,
                 )
-            else:
-                third_person_camera = ZedLeftCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
-                third_person_camera.configure_exposure(args)
             preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
-            top_preview = _capture_startup_preview(
-                top_camera,
+            stereo_preview_start = time.monotonic()
+            top_preview_image = None
+            right_preview_image = None
+            third_preview_image = None
+            for _ in range(args.camera_preview_samples):
+                if args.third_person_camera_backend == "zed-left":
+                    top_preview_image, right_preview_image, third_preview_image = zed_camera.read_views_rgb(
+                        ("left", top_hw),
+                        ("right", right_hw),
+                        ("left", third_hw),
+                    )
+                else:
+                    top_preview_image, right_preview_image = zed_camera.read_views_rgb(
+                        ("left", top_hw),
+                        ("right", right_hw),
+                    )
+            stereo_preview_elapsed_s = time.monotonic() - stereo_preview_start
+            assert top_preview_image is not None
+            assert right_preview_image is not None
+            top_preview = _preview_summary_from_image(
+                zed_camera.properties("left"),
                 TOP_IMAGE_KEY,
                 top_hw,
                 args.camera_preview_samples,
+                stereo_preview_elapsed_s,
+                top_preview_image,
                 preview_dir,
             )
-            third_preview = _capture_startup_preview(
-                third_person_camera,
-                THIRD_PERSON_IMAGE_KEY,
-                third_hw,
+            right_preview = _preview_summary_from_image(
+                zed_camera.properties("right"),
+                RIGHT_ZED_IMAGE_KEY,
+                right_hw,
                 args.camera_preview_samples,
+                stereo_preview_elapsed_s,
+                right_preview_image,
                 preview_dir,
             )
+            if args.third_person_camera_backend == "realsense":
+                third_preview = _capture_startup_preview(
+                    third_person_camera,
+                    THIRD_PERSON_IMAGE_KEY,
+                    third_hw,
+                    args.camera_preview_samples,
+                    preview_dir,
+                )
+            else:
+                assert third_preview_image is not None
+                third_preview = _preview_summary_from_image(
+                    zed_camera.properties("left"),
+                    THIRD_PERSON_IMAGE_KEY,
+                    third_hw,
+                    args.camera_preview_samples,
+                    stereo_preview_elapsed_s,
+                    third_preview_image,
+                    preview_dir,
+                )
             _print_camera_summary(top_preview)
+            _print_camera_summary(right_preview)
             _print_camera_summary(third_preview)
             if preview_dir is not None:
                 manifest_path = preview_dir / "manifest.json"
@@ -772,7 +887,7 @@ def main() -> int:
                             "policy_path": policy_path,
                             "task": args.task,
                             "policy_features": policy_features,
-                            "cameras": [top_preview, third_preview],
+                            "cameras": [top_preview, right_preview, third_preview],
                         },
                         indent=2,
                         sort_keys=True,
@@ -786,6 +901,7 @@ def main() -> int:
             torch = None
             prepare_observation_for_inference = None
             top_hw = (args.camera_height, args.camera_width)
+            right_hw = (args.camera_height, args.camera_width)
             third_hw = (args.camera_height, args.camera_width)
 
         print(
@@ -809,15 +925,29 @@ def main() -> int:
                 assert policy is not None
                 assert preprocess is not None
                 assert postprocess is not None
-                assert top_camera is not None
-                assert third_person_camera is not None
+                assert policy_state_dim is not None
+                assert zed_camera is not None
                 assert torch is not None
                 assert prepare_observation_for_inference is not None
 
+                if args.third_person_camera_backend == "zed-left":
+                    top_image, right_image, third_person_image = zed_camera.read_views_rgb(
+                        ("left", top_hw),
+                        ("right", right_hw),
+                        ("left", third_hw),
+                    )
+                else:
+                    top_image, right_image = zed_camera.read_views_rgb(
+                        ("left", top_hw),
+                        ("right", right_hw),
+                    )
+                    assert third_person_camera is not None
+                    third_person_image = third_person_camera.read_rgb(third_hw)
                 raw_observation = {
-                    OBS_STATE_KEY: _robot_state_vector(obs),
-                    TOP_IMAGE_KEY: top_camera.read_rgb(top_hw),
-                    THIRD_PERSON_IMAGE_KEY: third_person_camera.read_rgb(third_hw),
+                    OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
+                    TOP_IMAGE_KEY: top_image,
+                    RIGHT_ZED_IMAGE_KEY: right_image,
+                    THIRD_PERSON_IMAGE_KEY: third_person_image,
                 }
                 frame = prepare_observation_for_inference(
                     raw_observation,
@@ -855,8 +985,8 @@ def main() -> int:
         action_sock.close()
         if action_log is not None:
             action_log.close()
-        if top_camera is not None:
-            top_camera.close()
+        if zed_camera is not None:
+            zed_camera.close()
         if third_person_camera is not None:
             third_person_camera.close()
 

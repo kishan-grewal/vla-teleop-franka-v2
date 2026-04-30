@@ -14,9 +14,9 @@ Why:
 
 - The local `lerobot` checkout requires Python `>=3.12`.
 - Our policy runner currently blocks Python `3.14` because `draccus` config
-  parsing is failing in this workspace under `3.14`.
+parsing is failing in this workspace under `3.14`.
 - Python `3.13` is a good default for this repo, but `pyzed` wheel availability
-  depends on the installed ZED SDK.
+depends on the installed ZED SDK.
 
 ## Fresh Setup
 
@@ -142,7 +142,7 @@ List both RealSense and ZED serials directly from the main runner:
 ```bash
 cd /home/radu/vla-teleop-franka-v2-model-deploy
 source ./lerobot/.venv/bin/activate
-uv run --project ./lerobot python franka_xr_teleop/tools/run_smolvla_policy.py --list-cameras
+python franka_xr_teleop/tools/run_smolvla_policy.py --list-cameras
 ```
 
 Example output:
@@ -158,7 +158,7 @@ Example launch:
 
 ```bash
 source ./lerobot/.venv/bin/activate
-uv run --project ./lerobot python franka_xr_teleop/tools/run_smolvla_policy.py \
+python franka_xr_teleop/tools/run_smolvla_policy.py \
   --policy-path ./model/pretrained_model \
   --obs-port 28081 \
   --bridge-ip 127.0.0.1 \
@@ -230,7 +230,7 @@ Possible causes:
 
 - the ZED SDK is not installed
 - the active Python version does not have a matching wheel for your installed
-  ZED SDK
+ZED SDK
 - the script was run outside the intended venv
 
 Fixes:
@@ -238,7 +238,7 @@ Fixes:
 - verify `/usr/local/zed/get_python_api.py` exists
 - activate `lerobot/.venv` first
 - if Python `3.13` is unsupported by the current ZED SDK, recreate the venv
-  with Python `3.12` and rerun the script
+with Python `3.12` and rerun the script
 
 ### `pyrealsense2` Install Fails
 
@@ -284,3 +284,4 @@ source /home/radu/vla-teleop-franka-v2-model-deploy/lerobot/.venv/bin/activate
 cd /usr/local/zed
 python3 get_python_api.py
 ```
+
