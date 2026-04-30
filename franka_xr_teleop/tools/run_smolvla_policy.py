@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import select
 import socket
 import sys
 import threading
@@ -32,6 +34,16 @@ SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
 EXPOSURE_AUTO_SENTINEL = -1
 EXPOSURE_MIN = 0
 EXPOSURE_MAX = 100
+REHOME_REQUEST_REPEAT_PACKETS = 10
+
+with contextlib.suppress(ImportError):
+    import termios
+    import tty
+
+if "termios" not in globals():
+    termios = None  # type: ignore[assignment]
+if "tty" not in globals():
+    tty = None  # type: ignore[assignment]
 
 
 def _ensure_supported_python() -> None:
@@ -89,6 +101,45 @@ class LatestRobotObservation:
             if isinstance(obs, dict):
                 with self._lock:
                     self._latest = obs
+
+
+class KeyboardMonitor:
+    def __init__(self) -> None:
+        self._enabled = bool(sys.stdin.isatty() and termios is not None and tty is not None)
+        self._fd = sys.stdin.fileno() if self._enabled else None
+        self._saved_attrs: list[Any] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def start(self) -> None:
+        if not self._enabled or self._fd is None:
+            return
+        self._saved_attrs = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+
+    def stop(self) -> None:
+        if self._saved_attrs is None or self._fd is None:
+            return
+        termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attrs)
+        self._saved_attrs = None
+
+    def poll(self) -> list[str]:
+        if not self._enabled or self._fd is None:
+            return []
+        chars: list[str] = []
+        while True:
+            readable, _writeable, _exceptional = select.select([self._fd], [], [], 0.0)
+            if not readable:
+                break
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            chars.append(ch)
+        return chars
 
 class ZedStereoCamera:
     def __init__(self, serial: int, resolution: str, fps: int) -> None:
@@ -505,13 +556,19 @@ def _send_action(sock: socket.socket,
                  dst: tuple[str, int],
                  sequence_id: int,
                  action: np.ndarray,
-                 enabled: bool) -> None:
+                 enabled: bool,
+                 operator_request_id: int = 0,
+                 request_rehome: bool = False) -> None:
     message = {
         "timestamp_ns": time.monotonic_ns(),
         "sequence_id": sequence_id,
         "enabled": enabled,
         "action": [float(v) for v in action],
     }
+    if operator_request_id > 0:
+        message["operator_request_id"] = int(operator_request_id)
+    if request_rehome:
+        message["request_rehome"] = True
     sock.sendto(json.dumps(message, separators=(",", ":")).encode("utf-8"), dst)
 
 
@@ -770,6 +827,7 @@ def main() -> int:
     action_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dst = (args.bridge_ip, args.action_port)
     period_s = 1.0 / args.rate_hz
+    keyboard = KeyboardMonitor()
 
     policy = None
     preprocess = None
@@ -909,19 +967,59 @@ def main() -> int:
             f"from observations udp://{args.obs_bind_ip}:{args.obs_port}",
             flush=True,
         )
+        keyboard.start()
+        if keyboard.enabled:
+            print(
+                "Operator controls: [p] pause policy, [h] pause and re-home the arm, "
+                "[r] resume policy, [q] quit",
+                flush=True,
+            )
+        else:
+            print(
+                "Operator key controls unavailable because stdin is not a TTY. "
+                "The runner will stream automatically until interrupted.",
+                flush=True,
+            )
 
         sequence_id = 0
+        operator_paused = False
+        operator_request_id = 0
+        rehome_request_retries_remaining = 0
         while True:
             start = time.monotonic()
+            for key in keyboard.poll():
+                normalized = key.lower()
+                if normalized == "p":
+                    operator_paused = True
+                    print("Policy paused by operator.", flush=True)
+                elif normalized == "h":
+                    operator_paused = True
+                    operator_request_id += 1
+                    rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
+                    print(
+                        f"Re-home requested by operator (request_id={operator_request_id}). "
+                        "Policy will stay paused until you press 'r'.",
+                        flush=True,
+                    )
+                elif normalized == "r":
+                    operator_paused = False
+                    print("Policy resume requested by operator.", flush=True)
+                elif normalized == "q":
+                    print("Operator requested shutdown.", flush=True)
+                    return 0
+
             obs = obs_rx.latest()
-            if obs is None:
+            if obs is None and not args.zero_actions and not operator_paused:
                 time.sleep(min(period_s, 0.05))
                 continue
 
             sequence_id += 1
-            if args.zero_actions:
+            request_rehome = rehome_request_retries_remaining > 0
+            enabled = (not operator_paused) and not request_rehome
+            if args.zero_actions or operator_paused:
                 raw_action = np.zeros(7, dtype=np.float64)
             else:
+                assert obs is not None
                 assert policy is not None
                 assert preprocess is not None
                 assert postprocess is not None
@@ -966,14 +1064,28 @@ def main() -> int:
                 "sequence_id": sequence_id,
                 "source": "zero_actions" if args.zero_actions else "policy",
                 "task": args.task,
-                "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                "robot_observation_timestamp_ns": None if obs is None else obs.get("timestamp_ns"),
+                "enabled": enabled,
+                "operator_paused": operator_paused,
+                "operator_request_id": operator_request_id,
+                "request_rehome": request_rehome,
                 "raw_action": _jsonable_action(raw_action),
                 "clamped_action": _jsonable_action(action),
                 "max_translation_m": args.max_translation_m,
                 "max_rotation_rad": args.max_rotation_rad,
                 **clamp_info,
             })
-            _send_action(action_sock, dst, sequence_id, action, enabled=True)
+            _send_action(
+                action_sock,
+                dst,
+                sequence_id,
+                action,
+                enabled=enabled,
+                operator_request_id=operator_request_id,
+                request_rehome=request_rehome,
+            )
+            if rehome_request_retries_remaining > 0:
+                rehome_request_retries_remaining -= 1
 
             elapsed = time.monotonic() - start
             if elapsed < period_s:
@@ -981,6 +1093,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        keyboard.stop()
         obs_rx.stop()
         action_sock.close()
         if action_log is not None:

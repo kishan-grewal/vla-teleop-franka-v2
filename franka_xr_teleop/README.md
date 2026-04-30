@@ -164,6 +164,14 @@ In another terminal, run the policy sidecar:
 (`outputs/<dataset>_smolvla`) or directly at a LeRobot checkpoint export such
 as `outputs/<dataset>_smolvla/checkpoints/last/pretrained_model`.
 
+When `run_smolvla_policy.py` is attached to a terminal, it also accepts live
+operator keys:
+
+- `p`: pause policy actions (bridge receives `enabled=false`)
+- `h`: pause policy actions and send a one-shot arm re-home request to the bridge
+- `r`: resume policy actions after the arm has finished re-homing
+- `q`: stop the runner
+
 For a bridge smoke test without loading a model or cameras:
 
 ```bash

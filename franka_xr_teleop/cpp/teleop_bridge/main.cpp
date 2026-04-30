@@ -360,6 +360,8 @@ int main(int argc, char** argv) {
                     << " seq=" << cmd.sequence_id
                     << " age_ms=" << (age_ns * 1e-6)
                     << " enabled=" << (cmd.enabled ? 1 : 0)
+                    << " op_request_id=" << cmd.operator_request_id
+                    << " request_rehome=" << (cmd.request_rehome ? 1 : 0)
                     << " action=[" << cmd.action.delta_translation_m[0] << ","
                     << cmd.action.delta_translation_m[1] << ","
                     << cmd.action.delta_translation_m[2] << ","

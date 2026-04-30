@@ -141,10 +141,12 @@ struct TeleopAction {
 struct PolicyActionCommand {
   uint64_t timestamp_ns = 0;
   uint64_t sequence_id = 0;
+  uint64_t operator_request_id = 0;
   TeleopAction action{};
   bool enabled = false;
   bool episode_start = false;
   bool episode_end = false;
+  bool request_rehome = false;
 };
 
 struct FaultFlags {

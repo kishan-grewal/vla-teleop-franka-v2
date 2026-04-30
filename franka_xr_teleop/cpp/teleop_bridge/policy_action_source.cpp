@@ -52,9 +52,11 @@ bool ParsePolicyAction(const std::string& payload,
   PolicyActionCommand cmd{};
   cmd.timestamp_ns = root.value("timestamp_ns", receive_ns);
   cmd.sequence_id = root.value("sequence_id", fallback_sequence_id);
+  cmd.operator_request_id = root.value("operator_request_id", uint64_t{0});
   cmd.enabled = root.value("enabled", true);
   cmd.episode_start = root.value("episode_start", false);
   cmd.episode_end = root.value("episode_end", false);
+  cmd.request_rehome = root.value("request_rehome", false);
 
   if (root.contains("action")) {
     const json& action = root["action"];
