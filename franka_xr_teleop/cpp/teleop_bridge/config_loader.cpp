@@ -207,6 +207,12 @@ bool LoadTeleopConfig(const std::string& path, AppConfig* config, std::string* e
       config->bridge.policy.action_port = static_cast<uint16_t>(action_port);
     }
     ReadScalar(policy, "command_timeout_s", &config->bridge.policy.command_timeout_s);
+    ReadScalar(policy, "max_joint_delta_rad", &config->bridge.policy.max_joint_delta_rad);
+    ReadScalar(policy, "max_joint_distance_rad", &config->bridge.policy.max_joint_distance_rad);
+    ReadScalar(policy, "tracking_position_error_rad", &config->bridge.policy.tracking_position_error_rad);
+    ReadScalar(policy, "tracking_target_error_rad", &config->bridge.policy.tracking_target_error_rad);
+    ReadScalar(policy, "tracking_fault_dwell_s", &config->bridge.policy.tracking_fault_dwell_s);
+    ReadScalar(policy, "tracking_inhibit_s", &config->bridge.policy.tracking_inhibit_s);
   }
 
   return true;
@@ -264,6 +270,30 @@ bool LoadAppConfig(const std::string& config_dir, AppConfig* config, std::string
   }
   if (config->bridge.policy.command_timeout_s <= 0.0) {
     *error = "teleop.policy.command_timeout_s must be > 0";
+    return false;
+  }
+  if (config->bridge.policy.max_joint_delta_rad <= 0.0) {
+    *error = "teleop.policy.max_joint_delta_rad must be > 0";
+    return false;
+  }
+  if (config->bridge.policy.max_joint_distance_rad <= 0.0) {
+    *error = "teleop.policy.max_joint_distance_rad must be > 0";
+    return false;
+  }
+  if (config->bridge.policy.tracking_position_error_rad <= 0.0) {
+    *error = "teleop.policy.tracking_position_error_rad must be > 0";
+    return false;
+  }
+  if (config->bridge.policy.tracking_target_error_rad <= 0.0) {
+    *error = "teleop.policy.tracking_target_error_rad must be > 0";
+    return false;
+  }
+  if (config->bridge.policy.tracking_fault_dwell_s <= 0.0) {
+    *error = "teleop.policy.tracking_fault_dwell_s must be > 0";
+    return false;
+  }
+  if (config->bridge.policy.tracking_inhibit_s <= 0.0) {
+    *error = "teleop.policy.tracking_inhibit_s must be > 0";
     return false;
   }
   if (config->bridge.teleop.control_trigger_threshold < 0.0 ||

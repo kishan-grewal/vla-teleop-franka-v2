@@ -29,7 +29,7 @@ THIRD_PERSON_IMAGE_KEY = "observation.images.third_person_d405"
 ACTION_KEY = "action"
 JOINT_ACTION_DIM = 7
 POLICY_ACTION_DIM = 8
-SUPPORTED_STATE_DIMS = (8, 22)
+POLICY_STATE_DIM = 8
 SUPPORTED_PYTHON_MIN = (3, 12)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
 EXPOSURE_AUTO_SENTINEL = -1
@@ -411,35 +411,17 @@ def _resolve_policy_path(path: Path) -> Path:
 
 
 def _robot_state_vector(obs: dict[str, Any], expected_dim: int) -> np.ndarray:
+    if expected_dim != POLICY_STATE_DIM:
+        raise ValueError(
+            f"Unsupported policy state dimension {expected_dim}; "
+            f"runner expects exactly [{POLICY_STATE_DIM}] = 7 joint angles + 1 gripper width"
+        )
     state = obs.get("robot_state", {})
     q = state.get("q", [])
     if len(q) != 7:
         raise ValueError("robot_state.q must contain 7 joints")
-    dq = state.get("dq", [])
-    if expected_dim == 22 and len(dq) != 7:
-        raise ValueError("robot_state.dq must contain 7 joint velocities for 22D state models")
-    tcp_position = state.get("tcp_position_xyz", [])
-    if expected_dim == 22 and len(tcp_position) != 3:
-        raise ValueError("robot_state.tcp_position_xyz must contain 3 values for 22D state models")
-    tcp_orientation = state.get("tcp_orientation_xyzw", [])
-    if expected_dim == 22 and len(tcp_orientation) != 4:
-        raise ValueError("robot_state.tcp_orientation_xyzw must contain 4 values for 22D state models")
     gripper_width = float(state.get("gripper_width", 0.0))
-    if expected_dim == 8:
-        values = [*map(float, q), gripper_width]
-    elif expected_dim == 22:
-        values = [
-            *map(float, q),
-            *map(float, dq),
-            *map(float, tcp_position),
-            *map(float, tcp_orientation),
-            gripper_width,
-        ]
-    else:
-        raise ValueError(
-            f"Unsupported policy state dimension {expected_dim}; "
-            f"runner currently supports {list(SUPPORTED_STATE_DIMS)}"
-        )
+    values = [*map(float, q), gripper_width]
     return np.asarray(values, dtype=np.float32)
 
 
@@ -482,10 +464,11 @@ def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_fu
         errors.append(f"missing required input feature {OBS_STATE_KEY!r}")
     elif state_shape is None or len(state_shape) != 1:
         errors.append(f"{OBS_STATE_KEY!r} must have shape [D], got {list(state_shape or [])}")
-    elif state_shape[0] not in SUPPORTED_STATE_DIMS:
+    elif state_shape != (POLICY_STATE_DIM,):
         errors.append(
-            f"{OBS_STATE_KEY!r} must have one of the supported dimensions "
-            f"{list(SUPPORTED_STATE_DIMS)}, got {list(state_shape)}"
+            f"{OBS_STATE_KEY!r} must have shape [{POLICY_STATE_DIM}] "
+            "(7 joint angles + 1 gripper width), "
+            f"got {list(state_shape)}"
         )
 
     for key in image_keys:
@@ -519,7 +502,7 @@ def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_fu
         "input_features": _feature_summary(input_features),
         "output_features": _feature_summary(output_features),
         "live_observation_keys": [OBS_STATE_KEY, *image_keys],
-        "expected_state_dim": state_shape[0] if state_shape else None,
+        "expected_state_dim": POLICY_STATE_DIM,
         "expected_action_dim": POLICY_ACTION_DIM,
         "image_features": sorted(image_features),
     }

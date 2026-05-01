@@ -323,6 +323,12 @@ struct PolicyRuntimeConfig {
   std::string bind_ip = "0.0.0.0";
   uint16_t action_port = 28082;
   double command_timeout_s = 0.20;
+  double max_joint_delta_rad = 0.35;
+  double max_joint_distance_rad = 0.60;
+  double tracking_position_error_rad = 0.20;
+  double tracking_target_error_rad = 0.35;
+  double tracking_fault_dwell_s = 0.25;
+  double tracking_inhibit_s = 0.75;
 };
 
 struct TeleopBridgeConfig {

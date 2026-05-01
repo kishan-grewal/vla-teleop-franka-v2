@@ -24,6 +24,12 @@ teleop:
     bind_ip: 0.0.0.0
     action_port: 28082
     command_timeout_s: 0.20
+    max_joint_delta_rad: 0.35
+    max_joint_distance_rad: 0.60
+    tracking_position_error_rad: 0.20
+    tracking_target_error_rad: 0.35
+    tracking_fault_dwell_s: 0.25
+    tracking_inhibit_s: 0.75
   ik:
     damping: 0.08
     nullspace_gain: 0.15

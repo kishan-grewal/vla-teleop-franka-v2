@@ -100,6 +100,67 @@ Pose PoseFromJointPositions(const franka::Model& model,
   return MatrixToPose(model.pose(franka::Frame::kEndEffector, q, snapshot.F_T_EE, snapshot.EE_T_K));
 }
 
+double MaxAbsJointDelta(const std::array<double, 7>& a, const std::array<double, 7>& b) {
+  double max_abs = 0.0;
+  for (size_t i = 0; i < 7; ++i) {
+    max_abs = std::max(max_abs, std::abs(a[i] - b[i]));
+  }
+  return max_abs;
+}
+
+double JointDeltaNorm(const std::array<double, 7>& a, const std::array<double, 7>& b) {
+  double sum_sq = 0.0;
+  for (size_t i = 0; i < 7; ++i) {
+    const double delta = a[i] - b[i];
+    sum_sq += delta * delta;
+  }
+  return std::sqrt(sum_sq);
+}
+
+bool PoseInsideWorkspace(const Pose& pose, const SafetyLimits& limits) {
+  for (size_t i = 0; i < 3; ++i) {
+    if (pose.p[i] < limits.workspace_min[i] || pose.p[i] > limits.workspace_max[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ValidatePolicyJointTarget(const franka::Model& model,
+                               const RobotSnapshot& snapshot,
+                               const std::array<double, 7>& candidate_q,
+                               const TeleopBridgeConfig& config,
+                               std::array<double, 7>* validated_q,
+                               Pose* target_pose,
+                               FaultFlags* faults) {
+  *validated_q = ClampToJointLimits(candidate_q);
+  const double max_abs_joint_delta = MaxAbsJointDelta(*validated_q, snapshot.q_d);
+  const double joint_delta_norm = JointDeltaNorm(*validated_q, snapshot.q_d);
+  if (max_abs_joint_delta > config.policy.max_joint_delta_rad ||
+      joint_delta_norm > config.policy.max_joint_distance_rad) {
+    faults->jump_rejected = true;
+    return false;
+  }
+
+  *target_pose = PoseFromJointPositions(model, snapshot, *validated_q);
+  if (!PoseInsideWorkspace(*target_pose, config.safety)) {
+    faults->workspace_clamped = true;
+    return false;
+  }
+
+  const Eigen::Vector3d tcp_translation_jump =
+      ToEigen(target_pose->p) - ToEigen(snapshot.tcp_pose_d.p);
+  const Eigen::Vector3d tcp_rotation_jump =
+      QuaternionErrorAngleAxis(ToEigenQuat(snapshot.tcp_pose_d.q), ToEigenQuat(target_pose->q));
+  if (tcp_translation_jump.norm() > config.safety.jump_reject_translation_m ||
+      tcp_rotation_jump.norm() > config.safety.jump_reject_rotation_rad) {
+    faults->jump_rejected = true;
+    return false;
+  }
+
+  return true;
+}
+
 bool SolveIkStep(const franka::Model& model,
                  const RobotSnapshot& snapshot,
                  const Pose& desired_pose,
@@ -819,8 +880,7 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         requested_action = policy_cmd.action;
         requested_action.gripper_command = gripper_command;
         if (requested_action.action_space == ActionSpace::kJointPositionAbsolute) {
-          q_target = ClampToJointLimits(requested_action.joint_positions_rad);
-          desired_pose = PoseFromJointPositions(model, robot, q_target);
+          desired_pose = robot.tcp_pose;
         } else {
           desired_pose = ApplyPolicyActionDelta(robot.tcp_pose, requested_action);
         }
@@ -856,8 +916,9 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       const bool use_direct_joint_target =
           policy_control && requested_action.action_space == ActionSpace::kJointPositionAbsolute;
       if (use_direct_joint_target) {
-        safe_target = true;
-        safe_pose = desired_pose;
+        safe_target = ValidatePolicyJointTarget(
+            model, robot, requested_action.joint_positions_rad, config, &q_target, &safe_pose, &planned.faults);
+        desired_pose = safe_pose;
       } else if (policy_control) {
         safe_target = safety.FilterTargetPose(robot.tcp_pose, desired_pose, 0.0, &planned.faults, &safe_pose);
       } else {
@@ -1322,6 +1383,8 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
     uint64_t rt_trace_counter = 0;
     uint64_t last_success_rate_log_ns = 0;
     uint64_t motion_inhibit_until_ns = 0;
+    uint64_t policy_tracking_fault_until_ns = 0;
+    uint64_t policy_tracking_fault_accum_ns = 0;
     uint32_t cartesian_contact_cycles = 0;
     uint64_t last_completed_rehome_request_id = 0;
     uint64_t pending_rehome_request_id = 0;
@@ -1372,14 +1435,40 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
               cartesian_contact_cycles >= kCartesianContactDebounceCycles;
 
           const PlannedTarget planned = planned_target_buffer.ReadLatest();
+          const double dt = std::max(period.toSec(), 1e-6);
+          double max_measured_command_error = 0.0;
+          double max_command_target_error = 0.0;
+          for (size_t i = 0; i < 7; ++i) {
+            max_measured_command_error =
+                std::max(max_measured_command_error, std::abs(state.q[i] - state.q_d[i]));
+            max_command_target_error =
+                std::max(max_command_target_error, std::abs(planned.target_q[i] - state.q_d[i]));
+          }
+          const bool policy_tracking_error =
+              config_.control_source == ControlSource::kPolicy && planned.teleop_active &&
+              (max_measured_command_error > config_.policy.tracking_position_error_rad ||
+               max_command_target_error > config_.policy.tracking_target_error_rad);
+          if (policy_tracking_error) {
+            policy_tracking_fault_accum_ns += static_cast<uint64_t>(dt * 1e9);
+          } else {
+            policy_tracking_fault_accum_ns = 0;
+          }
+          if (policy_tracking_fault_accum_ns >=
+              static_cast<uint64_t>(config_.policy.tracking_fault_dwell_s * 1e9)) {
+            policy_tracking_fault_until_ns =
+                std::max(policy_tracking_fault_until_ns,
+                         now_ns + static_cast<uint64_t>(config_.policy.tracking_inhibit_s * 1e9));
+            policy_tracking_fault_accum_ns = 0;
+          }
           const bool recovery_inhibit_active = now_ns < motion_inhibit_until_ns;
+          const bool policy_tracking_inhibit_active = now_ns < policy_tracking_fault_until_ns;
           const bool apply_motion = config_.allow_motion && planned.teleop_active && planned.target_fresh &&
                                     planned.control_mode != ControlMode::kHold &&
                                     !collision_active &&
                                     !sustained_cartesian_contact &&
-                                    !recovery_inhibit_active;
+                                    !recovery_inhibit_active &&
+                                    !policy_tracking_inhibit_active;
 
-          const double dt = std::max(period.toSec(), 1e-6);
           const double max_step = std::min(config_.ik.max_joint_step_rad,
                                            config_.ik.max_joint_velocity_radps * dt);
           const double rt_alpha = 0.0;
@@ -1445,7 +1534,7 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
           obs.faults.gripper_fault = obs.faults.gripper_fault || obs.gripper_state == GripperState::kFault;
           obs.faults.control_exception =
               obs.faults.control_exception || collision_active || sustained_cartesian_contact ||
-              recovery_inhibit_active;
+              recovery_inhibit_active || policy_tracking_inhibit_active;
           observation_buffer_->Publish(obs);
 
           if (trace_recorder != nullptr && ((rt_trace_counter++ % rt_trace_decimation) == 0)) {
