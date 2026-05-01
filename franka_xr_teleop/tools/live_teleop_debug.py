@@ -326,12 +326,15 @@ def main() -> int:
             gripper_width = float(safe_get(robot, "gripper_width", default=0.0))
             gripper_state = safe_get(robot, "gripper_state", default="N/A")
 
+            action_space = safe_get(action, "action_space", default="cartesian_delta")
             dpos = safe_get(action, "cartesian_delta_translation", default=[0.0, 0.0, 0.0])
             drot = safe_get(action, "cartesian_delta_rotation", default=[0.0, 0.0, 0.0])
+            joint_positions = safe_get(action, "joint_positions_rad", default=[0.0] * 7)
             grip_cmd = float(safe_get(action, "gripper_command", default=0.0))
 
             dpos_n = vec_norm(dpos)
             drot_n = vec_norm(drot)
+            joint_target_max = max(abs(float(x)) for x in joint_positions) if joint_positions else 0.0
             dq_max = max(abs(float(x)) for x in dq) if dq else 0.0
             stale_ms = (now - last_payload_t) * 1e3
             tcp_rpy = quat_xyzw_to_rpy_deg(tcp_q)
@@ -386,8 +389,10 @@ def main() -> int:
                         f"cmd_err=({commanded_rpy_err[0]:+6.1f},{commanded_rpy_err[1]:+6.1f},{commanded_rpy_err[2]:+6.1f})",
                         f"des_pos_err=({desired_pos_err[0]:+6.3f},{desired_pos_err[1]:+6.3f},{desired_pos_err[2]:+6.3f})m",
                         f"cmd_pos_err=({commanded_pos_err[0]:+6.3f},{commanded_pos_err[1]:+6.3f},{commanded_pos_err[2]:+6.3f})m",
+                        f"action_space={action_space}",
                         f"|dpos|={dpos_n:.4f}m",
                         f"|drot|={drot_n:.4f}rad",
+                        f"joint_tgt_max={joint_target_max:.4f}",
                         f"dq_max={dq_max:.4f}",
                         f"grip_cmd={grip_cmd:.3f}",
                         f"grip_state={gripper_state}",

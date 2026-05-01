@@ -40,6 +40,11 @@ enum class GripperState : uint8_t {
   kFault = 3,
 };
 
+enum class ActionSpace : uint8_t {
+  kCartesianDelta = 0,
+  kJointPositionAbsolute = 1,
+};
+
 inline const char* ToString(ControlMode mode) {
   switch (mode) {
     case ControlMode::kHold:
@@ -116,6 +121,16 @@ inline const char* ToString(GripperState state) {
   return "UNKNOWN";
 }
 
+inline const char* ToString(ActionSpace action_space) {
+  switch (action_space) {
+    case ActionSpace::kCartesianDelta:
+      return "cartesian_delta";
+    case ActionSpace::kJointPositionAbsolute:
+      return "joint_position_absolute";
+  }
+  return "unknown";
+}
+
 struct Pose {
   std::array<double, 3> p{};
   std::array<double, 4> q{{0.0, 0.0, 0.0, 1.0}};  // xyzw
@@ -133,8 +148,10 @@ struct XRCommand {
 };
 
 struct TeleopAction {
+  ActionSpace action_space = ActionSpace::kCartesianDelta;
   std::array<double, 3> delta_translation_m{};
   std::array<double, 3> delta_rotation_rad{};  // angle-axis
+  std::array<double, 7> joint_positions_rad{};
   double gripper_command = 0.0;                // normalized gripper state in [0, 1]
 };
 

@@ -94,11 +94,15 @@ std::string ObservationPublisher::ToJson(const RobotObservation& obs) const {
   ss << "},";
 
   ss << "\"executed_action\":{";
+  ss << "\"action_space\":\"" << ToString(obs.executed_action.action_space) << "\",";
   ss << "\"cartesian_delta_translation\":";
   AppendArray(&ss, obs.executed_action.delta_translation_m);
   ss << ',';
   ss << "\"cartesian_delta_rotation\":";
   AppendArray(&ss, obs.executed_action.delta_rotation_rad);
+  ss << ',';
+  ss << "\"joint_positions_rad\":";
+  AppendArray(&ss, obs.executed_action.joint_positions_rad);
   ss << ',';
   ss << "\"gripper_command\":" << obs.executed_action.gripper_command;
   ss << "},";

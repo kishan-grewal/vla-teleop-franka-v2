@@ -73,8 +73,12 @@
     },
     "executed_action": {
       "type": "object",
-      "required": ["cartesian_delta_translation", "cartesian_delta_rotation", "gripper_command"],
+      "required": ["action_space", "cartesian_delta_translation", "cartesian_delta_rotation", "joint_positions_rad", "gripper_command"],
       "properties": {
+        "action_space": {
+          "type": "string",
+          "enum": ["cartesian_delta", "joint_position_absolute"]
+        },
         "cartesian_delta_translation": {
           "type": "array",
           "items": {"type": "number"},
@@ -86,6 +90,12 @@
           "items": {"type": "number"},
           "minItems": 3,
           "maxItems": 3
+        },
+        "joint_positions_rad": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 7,
+          "maxItems": 7
         },
         "gripper_command": {"type": "number"}
       }

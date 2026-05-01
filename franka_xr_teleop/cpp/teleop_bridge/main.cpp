@@ -362,13 +362,24 @@ int main(int argc, char** argv) {
                     << " enabled=" << (cmd.enabled ? 1 : 0)
                     << " op_request_id=" << cmd.operator_request_id
                     << " request_rehome=" << (cmd.request_rehome ? 1 : 0)
-                    << " action=[" << cmd.action.delta_translation_m[0] << ","
-                    << cmd.action.delta_translation_m[1] << ","
-                    << cmd.action.delta_translation_m[2] << ","
-                    << cmd.action.delta_rotation_rad[0] << ","
-                    << cmd.action.delta_rotation_rad[1] << ","
-                    << cmd.action.delta_rotation_rad[2] << ","
-                    << cmd.action.gripper_command << "]\n";
+                    << " action_space=" << teleop::ToString(cmd.action.action_space);
+          if (cmd.action.action_space == teleop::ActionSpace::kJointPositionAbsolute) {
+            std::cout << " joint_positions=[" << cmd.action.joint_positions_rad[0] << ","
+                      << cmd.action.joint_positions_rad[1] << ","
+                      << cmd.action.joint_positions_rad[2] << ","
+                      << cmd.action.joint_positions_rad[3] << ","
+                      << cmd.action.joint_positions_rad[4] << ","
+                      << cmd.action.joint_positions_rad[5] << ","
+                      << cmd.action.joint_positions_rad[6] << "]";
+          } else {
+            std::cout << " action=[" << cmd.action.delta_translation_m[0] << ","
+                      << cmd.action.delta_translation_m[1] << ","
+                      << cmd.action.delta_translation_m[2] << ","
+                      << cmd.action.delta_rotation_rad[0] << ","
+                      << cmd.action.delta_rotation_rad[1] << ","
+                      << cmd.action.delta_rotation_rad[2] << "]";
+          }
+          std::cout << " gripper=" << cmd.action.gripper_command << "\n";
         }
         last_print_ns = now_ns;
       }

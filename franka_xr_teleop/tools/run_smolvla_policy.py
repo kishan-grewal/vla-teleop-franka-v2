@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a LeRobot policy (SmolVLA, ACT, or Pi0) and stream 7D Cartesian actions to the Franka bridge."""
+"""Run a LeRobot policy (SmolVLA, ACT, or Pi0) and stream absolute 7-joint targets to the Franka bridge."""
 
 from __future__ import annotations
 
@@ -27,7 +27,8 @@ TOP_IMAGE_KEY = "observation.images.top"
 RIGHT_ZED_IMAGE_KEY = "observation.images.ee_zed_m_right"
 THIRD_PERSON_IMAGE_KEY = "observation.images.third_person_d405"
 ACTION_KEY = "action"
-EXPECTED_ACTION_DIM = 7
+JOINT_ACTION_DIM = 7
+POLICY_ACTION_DIM = 8
 SUPPORTED_STATE_DIMS = (8, 22)
 SUPPORTED_PYTHON_MIN = (3, 12)
 SUPPORTED_PYTHON_MAX_EXCLUSIVE = (3, 14)
@@ -35,6 +36,15 @@ EXPOSURE_AUTO_SENTINEL = -1
 EXPOSURE_MIN = 0
 EXPOSURE_MAX = 100
 REHOME_REQUEST_REPEAT_PACKETS = 10
+JOINT_LIMIT_MARGIN_RAD = 0.02
+PANDA_JOINT_LOWER_LIMITS_RAD = np.asarray(
+    [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+    dtype=np.float64,
+)
+PANDA_JOINT_UPPER_LIMITS_RAD = np.asarray(
+    [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+    dtype=np.float64,
+)
 
 
 def _load_smolvla_policy_class() -> Any:
@@ -491,8 +501,8 @@ def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_fu
     action_shape = _feature_shape(output_features.get(ACTION_KEY))
     if ACTION_KEY not in output_features:
         errors.append(f"missing required output feature {ACTION_KEY!r}")
-    elif action_shape != (EXPECTED_ACTION_DIM,):
-        errors.append(f"{ACTION_KEY!r} must have shape [{EXPECTED_ACTION_DIM}], got {list(action_shape or [])}")
+    elif action_shape != (POLICY_ACTION_DIM,):
+        errors.append(f"{ACTION_KEY!r} must have shape [{POLICY_ACTION_DIM}], got {list(action_shape or [])}")
 
     supplied_live_keys = {OBS_STATE_KEY, *image_keys}
     missing_live_image_keys = [
@@ -510,7 +520,7 @@ def _validate_policy_features(policy: Any, image_keys: tuple[str, ...], print_fu
         "output_features": _feature_summary(output_features),
         "live_observation_keys": [OBS_STATE_KEY, *image_keys],
         "expected_state_dim": state_shape[0] if state_shape else None,
-        "expected_action_dim": EXPECTED_ACTION_DIM,
+        "expected_action_dim": POLICY_ACTION_DIM,
         "image_features": sorted(image_features),
     }
 
@@ -534,55 +544,41 @@ def _feature_image_shape(policy: Any, key: str, fallback_hw: tuple[int, int]) ->
     return fallback_hw
 
 
-def _clamp_action_with_info(
-    action: np.ndarray,
-    max_translation_m: float,
-    max_rotation_rad: float,
-) -> tuple[np.ndarray, dict[str, Any]]:
+def _clamp_action_with_info(action: np.ndarray) -> tuple[np.ndarray, float, dict[str, Any]]:
     action = np.asarray(action, dtype=np.float64).reshape(-1).copy()
-    if action.shape[0] != 7:
-        raise ValueError(f"Expected 7D action, got shape {action.shape}")
+    if action.shape[0] != POLICY_ACTION_DIM:
+        raise ValueError(f"Expected {POLICY_ACTION_DIM}D joint+gripper action, got shape {action.shape}")
     if not np.isfinite(action).all():
         raise ValueError(f"Policy action contains non-finite values: {action.tolist()}")
 
-    raw_translation_norm = float(np.linalg.norm(action[:3]))
-    raw_rotation_norm = float(np.linalg.norm(action[3:6]))
-    raw_gripper = float(action[6])
-    translation_clamped = False
-    rotation_clamped = False
-    gripper_clipped = not 0.0 <= raw_gripper <= 1.0
-
-    t_norm = float(np.linalg.norm(action[:3]))
-    if max_translation_m > 0 and t_norm > max_translation_m:
-        action[:3] *= max_translation_m / max(t_norm, 1e-12)
-        translation_clamped = True
-    r_norm = float(np.linalg.norm(action[3:6]))
-    if max_rotation_rad > 0 and r_norm > max_rotation_rad:
-        action[3:6] *= max_rotation_rad / max(r_norm, 1e-12)
-        rotation_clamped = True
-    action[6] = float(np.clip(action[6], 0.0, 1.0))
-    return action, {
-        "raw_translation_norm_m": raw_translation_norm,
-        "raw_rotation_norm_rad": raw_rotation_norm,
+    joint_positions = action[:JOINT_ACTION_DIM].copy()
+    raw_gripper = float(action[JOINT_ACTION_DIM])
+    raw_joint_min = float(np.min(joint_positions))
+    raw_joint_max = float(np.max(joint_positions))
+    lower = PANDA_JOINT_LOWER_LIMITS_RAD + JOINT_LIMIT_MARGIN_RAD
+    upper = PANDA_JOINT_UPPER_LIMITS_RAD - JOINT_LIMIT_MARGIN_RAD
+    clipped_mask = np.logical_or(joint_positions < lower, joint_positions > upper)
+    joint_positions = np.clip(joint_positions, lower, upper)
+    clamped_gripper = 1.0 if raw_gripper >= 0.5 else 0.0
+    return joint_positions, clamped_gripper, {
+        "joint_limit_margin_rad": JOINT_LIMIT_MARGIN_RAD,
+        "raw_joint_min_rad": raw_joint_min,
+        "raw_joint_max_rad": raw_joint_max,
+        "clamped_joint_min_rad": float(np.min(joint_positions)),
+        "clamped_joint_max_rad": float(np.max(joint_positions)),
+        "joint_limit_clipped": bool(np.any(clipped_mask)),
+        "joint_limit_clipped_indices": [int(i) for i, clipped in enumerate(clipped_mask) if clipped],
         "raw_gripper": raw_gripper,
-        "clamped_translation_norm_m": float(np.linalg.norm(action[:3])),
-        "clamped_rotation_norm_rad": float(np.linalg.norm(action[3:6])),
-        "clamped_gripper": float(action[6]),
-        "translation_clamped": translation_clamped,
-        "rotation_clamped": rotation_clamped,
-        "gripper_clipped": gripper_clipped,
+        "clamped_gripper": clamped_gripper,
+        "gripper_binarized": raw_gripper != clamped_gripper,
     }
-
-
-def _clamp_action(action: np.ndarray, max_translation_m: float, max_rotation_rad: float) -> np.ndarray:
-    action, _info = _clamp_action_with_info(action, max_translation_m, max_rotation_rad)
-    return action
 
 
 def _send_action(sock: socket.socket,
                  dst: tuple[str, int],
                  sequence_id: int,
-                 action: np.ndarray,
+                 joint_positions_rad: np.ndarray,
+                 gripper_command: float,
                  enabled: bool,
                  operator_request_id: int = 0,
                  request_rehome: bool = False) -> None:
@@ -590,7 +586,9 @@ def _send_action(sock: socket.socket,
         "timestamp_ns": time.monotonic_ns(),
         "sequence_id": sequence_id,
         "enabled": enabled,
-        "action": [float(v) for v in action],
+        "action_space": "joint_position_absolute",
+        "joint_positions_rad": [float(v) for v in joint_positions_rad],
+        "gripper_command": float(np.clip(gripper_command, 0.0, 1.0)),
     }
     if operator_request_id > 0:
         message["operator_request_id"] = int(operator_request_id)
@@ -608,6 +606,23 @@ def _write_jsonl(handle: TextIO | None, row: dict[str, Any]) -> None:
 
 def _jsonable_action(action: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
+
+
+def _current_joint_positions(obs: dict[str, Any]) -> np.ndarray:
+    q = obs.get("robot_state", {}).get("q", [])
+    if not isinstance(q, list) or len(q) != JOINT_ACTION_DIM:
+        raise ValueError("robot_state.q must contain 7 joint positions for joint-space policy control")
+    joint_positions = np.asarray(q, dtype=np.float64)
+    if not np.isfinite(joint_positions).all():
+        raise ValueError(f"robot_state.q contains non-finite values: {q}")
+    return joint_positions
+
+
+def _current_hold_action(obs: dict[str, Any]) -> np.ndarray:
+    joint_positions = _current_joint_positions(obs)
+    gripper_state = str(obs.get("robot_state", {}).get("gripper_state", "OPEN")).upper()
+    gripper_command = 1.0 if gripper_state in {"CLOSE", "HOLD"} else 0.0
+    return np.concatenate([joint_positions, np.asarray([gripper_command], dtype=np.float64)])
 
 
 def _timestamped_preview_dir(root: Path) -> Path:
@@ -835,14 +850,12 @@ def parse_args() -> argparse.Namespace:
         "--log-actions-jsonl",
         type=Path,
         default=None,
-        help="Optional JSONL path for raw/clamped policy actions and clamp metadata.",
+        help="Optional JSONL path for raw/clamped joint targets and clamp metadata.",
     )
-    parser.add_argument("--max-translation-m", type=float, default=0.030)
-    parser.add_argument("--max-rotation-rad", type=float, default=0.20)
     parser.add_argument(
         "--zero-actions",
         action="store_true",
-        help="Send enabled zero actions without loading any policy; useful for bridge smoke tests.",
+        help="Hold the current measured joint configuration without loading any policy; useful for bridge smoke tests.",
     )
     parser.add_argument("--exposure", type=int, default=60, help="ZED camera exposure to set manually.")
     parser.add_argument("--auto-exposure", action="store_true", help="Enable ZED auto exposure.")
@@ -1030,7 +1043,7 @@ def main() -> int:
             third_hw = (args.camera_height, args.camera_width)
 
         print(
-            f"Streaming policy actions to udp://{args.bridge_ip}:{args.action_port} "
+            f"Streaming policy joint targets to udp://{args.bridge_ip}:{args.action_port} "
             f"from observations udp://{args.obs_bind_ip}:{args.obs_port}",
             flush=True,
         )
@@ -1076,7 +1089,7 @@ def main() -> int:
                     return 0
 
             obs = obs_rx.latest()
-            if obs is None and not args.zero_actions and not operator_paused:
+            if obs is None:
                 time.sleep(min(period_s, 0.05))
                 continue
 
@@ -1084,9 +1097,8 @@ def main() -> int:
             request_rehome = rehome_request_retries_remaining > 0
             enabled = (not operator_paused) and not request_rehome
             if args.zero_actions or operator_paused:
-                raw_action = np.zeros(7, dtype=np.float64)
+                raw_action = _current_hold_action(obs)
             else:
-                assert obs is not None
                 assert policy is not None
                 assert preprocess is not None
                 assert postprocess is not None
@@ -1125,22 +1137,22 @@ def main() -> int:
                     action_tensor = postprocess(action_tensor)
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
 
-            action, clamp_info = _clamp_action_with_info(raw_action, args.max_translation_m, args.max_rotation_rad)
+            action, gripper_command, clamp_info = _clamp_action_with_info(raw_action)
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
                 "source": "zero_actions" if args.zero_actions else "policy",
                 "policy_type": None if args.zero_actions else args.policy_type,
                 "task": args.task,
-                "robot_observation_timestamp_ns": None if obs is None else obs.get("timestamp_ns"),
+                "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
                 "enabled": enabled,
                 "operator_paused": operator_paused,
                 "operator_request_id": operator_request_id,
                 "request_rehome": request_rehome,
-                "raw_action": _jsonable_action(raw_action),
-                "clamped_action": _jsonable_action(action),
-                "max_translation_m": args.max_translation_m,
-                "max_rotation_rad": args.max_rotation_rad,
+                "action_space": "joint_position_absolute",
+                "gripper_command": gripper_command,
+                "raw_joint_positions_rad": _jsonable_action(raw_action),
+                "clamped_joint_positions_rad": _jsonable_action(action),
                 **clamp_info,
             })
             _send_action(
@@ -1148,6 +1160,7 @@ def main() -> int:
                 dst,
                 sequence_id,
                 action,
+                gripper_command,
                 enabled=enabled,
                 operator_request_id=operator_request_id,
                 request_rehome=request_rehome,

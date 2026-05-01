@@ -94,6 +94,12 @@ Pose ApplyPolicyActionDelta(const Pose& current_pose, const TeleopAction& action
   return desired;
 }
 
+Pose PoseFromJointPositions(const franka::Model& model,
+                            const RobotSnapshot& snapshot,
+                            const std::array<double, 7>& q) {
+  return MatrixToPose(model.pose(franka::Frame::kEndEffector, q, snapshot.F_T_EE, snapshot.EE_T_K));
+}
+
 bool SolveIkStep(const franka::Model& model,
                  const RobotSnapshot& snapshot,
                  const Pose& desired_pose,
@@ -812,7 +818,12 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         has_target = inputs.xr_stream_healthy && policy_cmd.enabled && !policy_rehome_requested;
         requested_action = policy_cmd.action;
         requested_action.gripper_command = gripper_command;
-        desired_pose = ApplyPolicyActionDelta(robot.tcp_pose, requested_action);
+        if (requested_action.action_space == ActionSpace::kJointPositionAbsolute) {
+          q_target = ClampToJointLimits(requested_action.joint_positions_rad);
+          desired_pose = PoseFromJointPositions(model, robot, q_target);
+        } else {
+          desired_pose = ApplyPolicyActionDelta(robot.tcp_pose, requested_action);
+        }
       } else {
         has_target = mapper.ComputeTargetPose(robot.tcp_pose,
                                               xr_cmd,
@@ -842,7 +853,12 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         continue;
       }
 
-      if (policy_control) {
+      const bool use_direct_joint_target =
+          policy_control && requested_action.action_space == ActionSpace::kJointPositionAbsolute;
+      if (use_direct_joint_target) {
+        safe_target = true;
+        safe_pose = desired_pose;
+      } else if (policy_control) {
         safe_target = safety.FilterTargetPose(robot.tcp_pose, desired_pose, 0.0, &planned.faults, &safe_pose);
       } else {
         // Safety target shaping is intentionally bypassed in this simplified mode:
@@ -871,13 +887,21 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       planned.desired_tcp_pose = safe_pose;
 
       double manipulability = 0.0;
-      ik_ok = SolveIkStep(model,
-                          robot,
-                          safe_pose,
-                          config,
-                          planned.control_mode,
-                          &q_target,
-                          &manipulability);
+      if (use_direct_joint_target) {
+        safe_pose = PoseFromJointPositions(model, robot, q_target);
+        planned.desired_tcp_pose = safe_pose;
+        manipulability = ComputeManipulability(JacobianToEigen(
+            model.zeroJacobian(franka::Frame::kEndEffector, q_target, robot.F_T_EE, robot.EE_T_K)));
+        ik_ok = true;
+      } else {
+        ik_ok = SolveIkStep(model,
+                            robot,
+                            safe_pose,
+                            config,
+                            planned.control_mode,
+                            &q_target,
+                            &manipulability);
+      }
       if (!ik_ok) {
         planned.faults.ik_rejected = true;
         const bool can_reuse_target =

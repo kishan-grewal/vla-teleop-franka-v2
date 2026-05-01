@@ -23,11 +23,11 @@ namespace {
 
 using json = nlohmann::json;
 
-bool ReadVector3(const json& value, std::array<double, 3>* out) {
-  if (!value.is_array() || value.size() != 3) {
+bool ReadVector7(const json& value, std::array<double, 7>* out) {
+  if (!value.is_array() || value.size() != 7) {
     return false;
   }
-  for (size_t i = 0; i < 3; ++i) {
+  for (size_t i = 0; i < 7; ++i) {
     if (!value[i].is_number()) {
       return false;
     }
@@ -38,6 +38,15 @@ bool ReadVector3(const json& value, std::array<double, 3>* out) {
     (*out)[i] = v;
   }
   return true;
+}
+
+bool ParseActionSpace(const json& root, ActionSpace* out) {
+  const std::string action_space = root.value("action_space", std::string("joint_position_absolute"));
+  if (action_space == "joint_position_absolute") {
+    *out = ActionSpace::kJointPositionAbsolute;
+    return true;
+  }
+  return false;
 }
 
 bool ParsePolicyAction(const std::string& payload,
@@ -57,42 +66,25 @@ bool ParsePolicyAction(const std::string& payload,
   cmd.episode_start = root.value("episode_start", false);
   cmd.episode_end = root.value("episode_end", false);
   cmd.request_rehome = root.value("request_rehome", false);
-
-  if (root.contains("action")) {
-    const json& action = root["action"];
-    if (!action.is_array() || action.size() != 7) {
-      return false;
-    }
-    for (size_t i = 0; i < 3; ++i) {
-      if (!action[i].is_number()) {
-        return false;
-      }
-      cmd.action.delta_translation_m[i] = action[i].get<double>();
-    }
-    for (size_t i = 0; i < 3; ++i) {
-      if (!action[i + 3].is_number()) {
-        return false;
-      }
-      cmd.action.delta_rotation_rad[i] = action[i + 3].get<double>();
-    }
-    if (!action[6].is_number()) {
-      return false;
-    }
-    cmd.action.gripper_command = action[6].get<double>();
-  } else {
-    if (!root.contains("cartesian_delta_translation") ||
-        !root.contains("cartesian_delta_rotation")) {
-      return false;
-    }
-    if (!ReadVector3(root["cartesian_delta_translation"], &cmd.action.delta_translation_m) ||
-        !ReadVector3(root["cartesian_delta_rotation"], &cmd.action.delta_rotation_rad)) {
-      return false;
-    }
-    if (!root.contains("gripper_command") || !root["gripper_command"].is_number()) {
-      return false;
-    }
-    cmd.action.gripper_command = root["gripper_command"].get<double>();
+  if (!ParseActionSpace(root, &cmd.action.action_space)) {
+    return false;
   }
+
+  if (root.contains("joint_positions_rad")) {
+    if (!ReadVector7(root["joint_positions_rad"], &cmd.action.joint_positions_rad)) {
+      return false;
+    }
+  } else if (root.contains("action")) {
+    if (!ReadVector7(root["action"], &cmd.action.joint_positions_rad)) {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  if (!root.contains("gripper_command") || !root["gripper_command"].is_number()) {
+    return false;
+  }
+  cmd.action.gripper_command = root["gripper_command"].get<double>();
 
   for (double v : cmd.action.delta_translation_m) {
     if (!std::isfinite(v)) {
@@ -100,6 +92,11 @@ bool ParsePolicyAction(const std::string& payload,
     }
   }
   for (double v : cmd.action.delta_rotation_rad) {
+    if (!std::isfinite(v)) {
+      return false;
+    }
+  }
+  for (double v : cmd.action.joint_positions_rad) {
     if (!std::isfinite(v)) {
       return false;
     }

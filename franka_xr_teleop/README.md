@@ -83,7 +83,7 @@ Incoming normalized command fields used by the bridge:
 
 Outgoing observation stream (UDP JSON):
 - robot state: `q`, `dq`, TCP pose, gripper width, gripper state
-- executed action: cartesian delta, gripper command
+- executed action: action space, joint target, cartesian delta trace, gripper command
 - status: control mode, teleop state, packet age, fault flags
 
 ## Teleop State Machine
@@ -137,7 +137,7 @@ Live teleop:
 ```
 
 SmolVLA policy control keeps the same robot execution path, but replaces XR
-controller input with 7D Cartesian actions over UDP:
+controller input with absolute joint targets plus a gripper command over UDP:
 
 ```bash
 ./build/cpp/teleop_bridge/franka_xr_teleop_bridge \
