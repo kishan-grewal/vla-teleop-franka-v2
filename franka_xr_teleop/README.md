@@ -7,9 +7,9 @@ This module is the Franka-specific interface layer between XR-Robotics tracking/
 ## Scope
 
 - Receive operator state through XR-Robotics SDK callbacks (`PXREAInit` / `PXREADeviceStateJson`)
-- Map XR controller pose into robot-frame Cartesian teleop commands
+- Map XR controller pose into bounded joint-space targets
 - Enforce deadman/clutch/timeout/workspace/rate-limit safety
-- Execute bounded Cartesian deltas through libfranka
+- Execute bounded joint position commands through libfranka
 - Publish executed action + robot observation for later recording
 
 Non-goals:
@@ -82,8 +82,8 @@ Incoming normalized command fields used by the bridge:
 `timestamp_ns` is stamped on command receive using workstation monotonic time so timeout-to-hold logic is clock-safe.
 
 Outgoing observation stream (UDP JSON):
-- robot state: `q`, `dq`, TCP pose, gripper width, gripper state
-- executed action: action space, joint target, cartesian delta trace, gripper command
+- robot state: `q`, `q_cmd`, `dq`, TCP pose, gripper width, gripper state
+- executed action: action space, joint target, gripper command
 - status: control mode, teleop state, packet age, fault flags
 
 ## Teleop State Machine
@@ -199,9 +199,9 @@ Or manually record only UDP robot observations:
 
 Add `--with-receive-metadata` to include host receive timestamps and source
 address around each observation record. Pressing the Oculus right-controller B
-button emits a one-shot `status.episode_start` marker in the UDP stream; the
-recorder writes those markers to `recordings/session_001/episode_events.jsonl`
-by default.
+button emits a one-shot `status.episode_end` marker in the UDP stream and then
+triggers the full gripper-open plus arm rehome sequence; the recorder writes
+those markers to `recordings/session_001/episode_events.jsonl` by default.
 
 Record the end-effector ZED/ZED-M camera on the same host:
 

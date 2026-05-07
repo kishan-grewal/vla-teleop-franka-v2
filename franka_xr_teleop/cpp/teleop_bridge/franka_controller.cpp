@@ -33,14 +33,6 @@
 namespace teleop {
 namespace {
 
-constexpr double kStartupHomeSpeedRadPerS = 0.12;
-constexpr double kStartupHomeAccelerationRadPerS2 = 0.6;
-constexpr double kStartupHomeJerkRadPerS3 = 4.0;
-constexpr double kStartupHomeServoKp = 6.0;
-constexpr double kStartupHomeServoKd = 1.5;
-constexpr double kStartupHomeArrivalToleranceRad = 5e-3;
-constexpr double kStartupHomeVelocityToleranceRadPerS = 2e-2;
-constexpr uint32_t kStartupHomeSettledCycles = 100;
 constexpr double kRehomeLiftClearanceAboveWorkspaceMinM = 0.28;
 constexpr double kRehomeTopWorkspaceMarginM = 0.08;
 constexpr double kRehomeLiftTriggerToleranceM = 0.008;
@@ -49,8 +41,10 @@ constexpr double kRehomeJointSpeedRadPerS = 0.35;
 constexpr double kRehomeStopVelocityToleranceRadPerS = 0.02;
 constexpr double kRehomeStopCommandToleranceRad = 1e-3;
 constexpr uint32_t kRehomeStopSettledCycles = 60;
+constexpr double kStartupHomeArrivalToleranceRad = 5e-3;
 constexpr uint64_t kPlannerTargetGraceNs = 35000000ull;  // 35 ms
 constexpr uint64_t kEpisodeMarkerNs = 250000000ull;  // 250 ms
+constexpr uint64_t kPostRehomeMotionInhibitNs = 400000000ull;  // 400 ms settle window
 constexpr std::array<double, 7> kPandaJointLowerLimitsRad{
     {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973}};
 constexpr std::array<double, 7> kPandaJointUpperLimitsRad{
@@ -66,6 +60,13 @@ bool AnyPositive(const std::array<double, N>& values) {
     }
   }
   return false;
+}
+
+double QuinticSmoothstep(double tau) {
+  const double clamped_tau = std::clamp(tau, 0.0, 1.0);
+  const double tau2 = clamped_tau * clamped_tau;
+  const double tau3 = tau2 * clamped_tau;
+  return tau3 * (10.0 + clamped_tau * (-15.0 + 6.0 * clamped_tau));
 }
 
 std::array<double, 7> ClampToJointLimits(const std::array<double, 7>& q) {
@@ -208,6 +209,70 @@ bool RecoverRobotIfNeeded(franka::Robot* robot) {
   return true;
 }
 
+bool CommandGripperOpen(franka::Gripper* gripper,
+                        const GripperConfig& config,
+                        std::atomic<double>* measured_gripper_width_m) {
+  if (gripper == nullptr) {
+    return true;
+  }
+
+  try {
+    const bool move_ok = gripper->move(config.max_width_m, config.speed_mps);
+    const franka::GripperState state = gripper->readOnce();
+    if (measured_gripper_width_m != nullptr) {
+      measured_gripper_width_m->store(state.width, std::memory_order_release);
+    }
+    if (!move_ok) {
+      std::cerr << "Gripper open command returned false during homing.\n";
+    }
+    return move_ok;
+  } catch (const std::exception& e) {
+    std::cerr << "Gripper open command failed during homing: " << e.what() << "\n";
+    return false;
+  }
+}
+
+bool MoveToLiftPose(franka::Robot* robot,
+                    const SafetyLimits& safety,
+                    std::atomic<bool>* stop_requested) {
+  const franka::RobotState state0 = robot->readOnce();
+  const double current_z = state0.O_T_EE[14];
+  const double workspace_min_z = safety.workspace_min[2];
+  double lift_target_z = std::max(current_z, workspace_min_z + kRehomeLiftClearanceAboveWorkspaceMinM);
+  if (safety.enforce_workspace_limits_during_rehome) {
+    const double workspace_max_z = safety.workspace_max[2];
+    lift_target_z = std::clamp(
+        lift_target_z, workspace_min_z, workspace_max_z - kRehomeTopWorkspaceMarginM);
+  }
+  if (lift_target_z <= current_z + kRehomeLiftTriggerToleranceM) {
+    return true;
+  }
+
+  const std::array<double, 16> start_pose = state0.O_T_EE_d;
+  const std::array<double, 2> elbow = state0.elbow_d;
+  const double duration_s =
+      std::max(2.0, 1.875 * std::abs(lift_target_z - current_z) / kRehomeLiftSpeedMps);
+  double elapsed_s = 0.0;
+
+  robot->control(
+      [&](const franka::RobotState&, franka::Duration period) -> franka::CartesianPose {
+        elapsed_s += period.toSec();
+        const double tau = std::clamp(elapsed_s / duration_s, 0.0, 1.0);
+        const double smooth = QuinticSmoothstep(tau);
+        std::array<double, 16> commanded_pose = start_pose;
+        commanded_pose[14] = start_pose[14] + smooth * (lift_target_z - start_pose[14]);
+        franka::CartesianPose out(commanded_pose, elbow);
+        if (tau >= 1.0 || stop_requested->load(std::memory_order_acquire)) {
+          return franka::MotionFinished(out);
+        }
+        return out;
+      },
+      franka::ControllerMode::kJointImpedance,
+      true,
+      100.0);
+  return !stop_requested->load(std::memory_order_acquire);
+}
+
 bool MoveToHomePose(franka::Robot* robot,
                     const std::array<double, 7>& q_goal,
                     std::atomic<bool>* stop_requested) {
@@ -221,20 +286,19 @@ bool MoveToHomePose(franka::Robot* robot,
   if (max_error < kStartupHomeArrivalToleranceRad) {
     return true;
   }
-  const double min_duration_s = 2.5;
+
   const double duration_s =
-      std::max(min_duration_s, 1.875 * max_error / std::max(kRehomeJointSpeedRadPerS, 1e-6));
-  double time_s = 0.0;
+      std::max(2.5, 1.875 * max_error / kRehomeJointSpeedRadPerS);
+  double elapsed_s = 0.0;
   robot->control(
-      [&](const franka::RobotState& /*state*/, franka::Duration period) -> franka::JointPositions {
-        time_s += period.toSec();
-        const double tau = std::clamp(time_s / duration_s, 0.0, 1.0);
-        const double smooth = tau * tau * tau * (10.0 - 15.0 * tau + 6.0 * tau * tau);
+      [&](const franka::RobotState&, franka::Duration period) -> franka::JointPositions {
+        elapsed_s += period.toSec();
+        const double tau = std::clamp(elapsed_s / duration_s, 0.0, 1.0);
+        const double smooth = QuinticSmoothstep(tau);
         std::array<double, 7> q_cmd{};
         for (size_t i = 0; i < 7; ++i) {
           q_cmd[i] = q_start[i] + smooth * (q_goal_clamped[i] - q_start[i]);
         }
-
         franka::JointPositions out(q_cmd);
         if (tau >= 1.0 || stop_requested->load(std::memory_order_acquire)) {
           return franka::MotionFinished(out);
@@ -247,62 +311,35 @@ bool MoveToHomePose(franka::Robot* robot,
   return !stop_requested->load(std::memory_order_acquire);
 }
 
-bool MoveVerticalLift(franka::Robot* robot,
-                      double target_z,
-                      std::atomic<bool>* stop_requested) {
-  const franka::RobotState state0 = robot->readOnce();
-  const double start_z = state0.O_T_EE_d[14];
-  const double delta_z = target_z - start_z;
-  if (std::abs(delta_z) <= 1e-4) {
-    return true;
-  }
-  const std::array<double, 16> pose_start = state0.O_T_EE_d;
-  std::array<double, 16> pose_goal = pose_start;
-  pose_goal[14] = target_z;
-  const std::array<double, 2> elbow_start = state0.elbow_d;
-  const double min_duration_s = 2.0;
-  const double duration_s =
-      std::max(min_duration_s, 1.875 * std::abs(delta_z) / std::max(kRehomeLiftSpeedMps, 1e-6));
-  double time_s = 0.0;
-
-  robot->control([pose_start, pose_goal, elbow_start, &time_s, duration_s, stop_requested](
-                    const franka::RobotState&, franka::Duration period) -> franka::CartesianPose {
-    time_s += period.toSec();
-    const double tau = std::clamp(time_s / duration_s, 0.0, 1.0);
-    const double smooth = tau * tau * tau * (10.0 - 15.0 * tau + 6.0 * tau * tau);
-    std::array<double, 16> pose_cmd = pose_start;
-    pose_cmd[14] = pose_start[14] + smooth * (pose_goal[14] - pose_start[14]);
-    franka::CartesianPose out(pose_cmd, elbow_start);
-    if (tau >= 1.0 || stop_requested->load(std::memory_order_acquire)) {
-      return franka::MotionFinished(out);
-    }
-    return out;
-  });
-  return !stop_requested->load(std::memory_order_acquire);
-}
-
 bool MoveToSafeHomeRoute(franka::Robot* robot,
-                         const franka::Model& /*model*/,
                          const TeleopBridgeConfig& config,
                          std::atomic<bool>* stop_requested) {
-  const franka::RobotState state0 = robot->readOnce();
-  const Pose current_pose = MatrixToPose(state0.O_T_EE);
-  const double workspace_min_z = config.safety.workspace_min[2];
-  const double workspace_max_z = config.safety.workspace_max[2];
-  const double lift_target_z =
-      std::clamp(std::max(current_pose.p[2], workspace_min_z + kRehomeLiftClearanceAboveWorkspaceMinM),
-                 workspace_min_z,
-                 workspace_max_z - kRehomeTopWorkspaceMarginM);
-  if (lift_target_z > current_pose.p[2] + kRehomeLiftTriggerToleranceM) {
-    if (!MoveVerticalLift(robot, lift_target_z, stop_requested)) {
-      return false;
-    }
+  if (!MoveToLiftPose(robot, config.safety, stop_requested)) {
+    return false;
   }
-
   if (!MoveToHomePose(robot, config.ik.nullspace_joint_positions_rad, stop_requested)) {
     return false;
   }
-  return MoveToHomePose(robot, config.teleop.start_joint_positions_rad, stop_requested);
+  if (!MoveToHomePose(robot, config.teleop.start_joint_positions_rad, stop_requested)) {
+    return false;
+  }
+  return true;
+}
+
+void PublishHoldTarget(const RobotSnapshot& snapshot,
+                       double target_gripper_width_m,
+                       TeleopState teleop_state,
+                       LatestPlannedTargetBuffer* planned_target_buffer) {
+  PlannedTarget hold_target{};
+  hold_target.target_timestamp_ns = MonotonicNowNs();
+  hold_target.target_q = snapshot.q;
+  hold_target.desired_tcp_pose = snapshot.tcp_pose;
+  hold_target.target_gripper_width_m = target_gripper_width_m;
+  hold_target.control_mode = ControlMode::kHold;
+  hold_target.teleop_active = false;
+  hold_target.target_fresh = false;
+  hold_target.teleop_state = teleop_state;
+  planned_target_buffer->Publish(hold_target);
 }
 
 double MapTriggerToWidth(const GripperConfig& config, double trigger) {
@@ -327,6 +364,19 @@ bool GripperStateSatisfiesDesired(GripperState actual, GripperState desired) {
     return actual == GripperState::kClose || actual == GripperState::kHold;
   }
   return actual == desired;
+}
+
+GripperState WidthToAnalogState(const GripperConfig& config, double width, bool closing_stalled) {
+  if (closing_stalled) {
+    return GripperState::kHold;
+  }
+  if (width >= (config.max_width_m - config.width_tolerance_m)) {
+    return GripperState::kOpen;
+  }
+  if (width <= (config.min_width_m + config.width_tolerance_m)) {
+    return GripperState::kClose;
+  }
+  return GripperState::kHold;
 }
 
 Eigen::Matrix<double, 6, 7> JacobianToEigen(const std::array<double, 42>& jacobian_col_major) {
@@ -679,6 +729,10 @@ void PlannerLoop(const TeleopBridgeConfig& config,
                  uint32_t trace_decimation,
                  const std::atomic<GripperState>* active_gripper_state,
                  std::atomic<GripperState>* desired_gripper_state,
+                 std::atomic<double>* desired_gripper_width_m,
+                 std::atomic<uint64_t>* requested_rehome_request_id,
+                 const std::atomic<uint64_t>* completed_rehome_request_id,
+                 const std::atomic<bool>* rehome_in_progress,
                  std::atomic<bool>* stop_requested) {
   try {
     const auto sleep_period =
@@ -703,6 +757,8 @@ void PlannerLoop(const TeleopBridgeConfig& config,
     Pose last_valid_desired_pose{};
     ControlMode last_valid_control_mode = ControlMode::kHold;
     double last_valid_manipulability = 0.0;
+    uint64_t last_seen_completed_rehome_request_id =
+        completed_rehome_request_id->load(std::memory_order_acquire);
     uint64_t planner_last_ns = 0;
     uint64_t planner_trace_counter = 0;
     const uint32_t planner_trace_decimation = std::max<uint32_t>(1, trace_decimation);
@@ -726,17 +782,40 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       planned.control_mode = ControlMode::kHold;
       const double policy_gripper_command = Clamp01(policy_cmd.action.gripper_command);
       const bool policy_rehome_requested = policy_control && policy_cmd.request_rehome;
+      const uint64_t completed_rehome_id_snapshot =
+          completed_rehome_request_id->load(std::memory_order_acquire);
+      if (completed_rehome_id_snapshot != last_seen_completed_rehome_request_id) {
+        gripper_controller.Reset(GripperState::kOpen);
+        // Re-home moves the robot outside the normal teleop path, so any cached
+        // IK/planner target from before the move is stale and must not be reused
+        // as the next XR anchor.
+        has_recent_target = false;
+        last_valid_target_ns = 0;
+        last_valid_target_q = robot.q;
+        last_valid_desired_pose = robot.tcp_pose;
+        last_valid_control_mode = ControlMode::kHold;
+        last_valid_manipulability = 0.0;
+        last_seen_completed_rehome_request_id = completed_rehome_id_snapshot;
+      }
       const double gripper_trigger =
           policy_control ? policy_gripper_command : Clamp01(xr_cmd.gripper_trigger_value);
-      const GripperState desired_state =
-          policy_control
-              ? (policy_gripper_command >= 0.5 ? GripperState::kClose : GripperState::kOpen)
-              : gripper_controller.UpdateDesiredState(config.gripper, gripper_trigger, now_ns);
-      const double gripper_command =
-          policy_control ? policy_gripper_command : (desired_state == GripperState::kClose ? 1.0 : 0.0);
-      planned.target_gripper_width_m = MapStateToWidth(config.gripper, desired_state);
-      planned.requested_action.gripper_command = gripper_command;
-      desired_gripper_state->store(desired_state, std::memory_order_release);
+      GripperState desired_state = GripperState::kOpen;
+      double gripper_command = 0.0;
+      double desired_gripper_width = config.gripper.max_width_m;
+      if (policy_control) {
+        gripper_command = policy_gripper_command;
+        desired_state = policy_gripper_command >= 0.5 ? GripperState::kClose : GripperState::kOpen;
+        desired_gripper_width = MapStateToWidth(config.gripper, desired_state);
+      } else if (config.gripper.command_mode == GripperCommandMode::kAnalog) {
+        desired_gripper_width = MapTriggerToWidth(config.gripper, gripper_trigger);
+        gripper_command = gripper_trigger;
+        const double midpoint = 0.5 * (config.gripper.min_width_m + config.gripper.max_width_m);
+        desired_state = desired_gripper_width <= midpoint ? GripperState::kClose : GripperState::kOpen;
+      } else {
+        desired_state = gripper_controller.UpdateDesiredState(config.gripper, gripper_trigger, now_ns);
+        gripper_command = desired_state == GripperState::kClose ? 1.0 : 0.0;
+        desired_gripper_width = MapStateToWidth(config.gripper, desired_state);
+      }
       const double control_value =
           policy_control ? ((policy_cmd.enabled && !policy_rehome_requested) ? 1.0 : 0.0)
                          : Clamp01(xr_cmd.control_trigger_value);
@@ -835,9 +914,23 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         }
         if (button_b && !last_button_b) {
           episode_end_marker_until_ns = now_ns + kEpisodeMarkerNs;
+          const uint64_t requested_id =
+              requested_rehome_request_id->load(std::memory_order_acquire);
+          const uint64_t completed_id =
+              completed_rehome_request_id->load(std::memory_order_acquire);
+          if (requested_id <= completed_id) {
+            requested_rehome_request_id->store(completed_id + 1, std::memory_order_release);
+          }
         }
       } else if (button_b && !last_button_b) {
-        episode_start_marker_until_ns = now_ns + kEpisodeMarkerNs;
+        episode_end_marker_until_ns = now_ns + kEpisodeMarkerNs;
+        const uint64_t requested_id =
+            requested_rehome_request_id->load(std::memory_order_acquire);
+        const uint64_t completed_id =
+            completed_rehome_request_id->load(std::memory_order_acquire);
+        if (requested_id <= completed_id) {
+          requested_rehome_request_id->store(completed_id + 1, std::memory_order_release);
+        }
       }
       planned.episode_start =
           episode_start_marker_until_ns != 0 && now_ns <= episode_start_marker_until_ns;
@@ -845,7 +938,28 @@ void PlannerLoop(const TeleopBridgeConfig& config,
           episode_end_marker_until_ns != 0 && now_ns <= episode_end_marker_until_ns;
       last_button_a = button_a;
       last_button_b = button_b;
-      inputs.deadman_pressed = deadman_latched;
+      const uint64_t requested_rehome_id =
+          requested_rehome_request_id->load(std::memory_order_acquire);
+      const uint64_t completed_rehome_id = completed_rehome_id_snapshot;
+      const bool rehome_requested =
+          requested_rehome_id > completed_rehome_id ||
+          rehome_in_progress->load(std::memory_order_acquire);
+      const GripperState latched_gripper_state =
+          desired_gripper_state->load(std::memory_order_acquire);
+      const double latched_gripper_width =
+          desired_gripper_width_m->load(std::memory_order_acquire);
+      if (rehome_requested) {
+        deadman_latched = false;
+        desired_state = latched_gripper_state;
+        desired_gripper_width = latched_gripper_width;
+      }
+      planned.target_gripper_width_m = desired_gripper_width;
+      planned.requested_action.gripper_command = gripper_command;
+      if (!rehome_requested) {
+        desired_gripper_state->store(desired_state, std::memory_order_release);
+        desired_gripper_width_m->store(desired_gripper_width, std::memory_order_release);
+      }
+      inputs.deadman_pressed = rehome_requested ? false : deadman_latched;
       inputs.robot_ok = robot.robot_ok;
       inputs.fault_requested = false;
       inputs.clear_fault_requested = true;
@@ -857,12 +971,21 @@ void PlannerLoop(const TeleopBridgeConfig& config,
         planned.faults.packet_timeout = true;
       }
 
-      if (!planned.teleop_active) {
-        if (last_valid_target_ns != 0) {
+      if (!planned.teleop_active || rehome_requested) {
+        if (rehome_requested) {
+          planned.control_mode = ControlMode::kHold;
+          planned.teleop_active = false;
+          planned.target_fresh = false;
+          planned.desired_tcp_pose = robot.tcp_pose;
+          planned.requested_action = TeleopAction{};
+          planned.requested_action.gripper_command = gripper_command;
+        } else if (last_valid_target_ns != 0) {
           planned.desired_tcp_pose = last_valid_desired_pose;
         }
         has_recent_target = false;
-        if (!policy_control && inputs.xr_stream_healthy) {
+        if (rehome_requested) {
+          mapper.Reset();
+        } else if (!policy_control && inputs.xr_stream_healthy) {
           mapper.Reanchor(planned.desired_tcp_pose, xr_cmd);
         } else {
           mapper.Reset();
@@ -922,30 +1045,22 @@ void PlannerLoop(const TeleopBridgeConfig& config,
       } else if (policy_control) {
         safe_target = safety.FilterTargetPose(robot.tcp_pose, desired_pose, 0.0, &planned.faults, &safe_pose);
       } else {
-        // Safety target shaping is intentionally bypassed in this simplified mode:
-        // planner uses mapper output directly for IK.
-        safe_target = true;
-        safe_pose = desired_pose;
+        safe_target = safety.FilterTargetPose(robot.tcp_pose,
+                                              desired_pose,
+                                              packet_age_s,
+                                              &planned.faults,
+                                              &safe_pose);
       }
+      planned.desired_tcp_pose = safe_pose;
       if (!safe_target) {
-        const bool can_reuse_target =
-            has_recent_target && now_ns > last_valid_target_ns &&
-            (now_ns - last_valid_target_ns) <= kPlannerTargetGraceNs;
-        if (can_reuse_target) {
-          planned.control_mode = last_valid_control_mode;
-          planned.target_q = last_valid_target_q;
-          planned.desired_tcp_pose = last_valid_desired_pose;
-          planned.manipulability = last_valid_manipulability;
-          planned.target_fresh = true;
-        } else {
-          planned.control_mode = ControlMode::kHold;
-        }
+        has_recent_target = false;
+        planned.control_mode = ControlMode::kHold;
+        planned.target_fresh = false;
         planned_target_buffer->Publish(planned);
         publish_trace();
         std::this_thread::sleep_for(sleep_period);
         continue;
       }
-      planned.desired_tcp_pose = safe_pose;
 
       double manipulability = 0.0;
       if (use_direct_joint_target) {
@@ -1014,12 +1129,110 @@ void PlannerLoop(const TeleopBridgeConfig& config,
 //
 // Only two logical states: kOpen and kClose. No preemption, no retry
 // escalation, no homing recovery. One action runs until it self-terminates.
+void GripperLoopAnalog(franka::Gripper* gripper,
+                       const GripperConfig& config,
+                       const std::atomic<double>* desired_gripper_width_m,
+                       std::atomic<GripperState>* active_gripper_state,
+                       std::atomic<double>* measured_gripper_width_m,
+                       std::atomic<bool>* stop_requested) {
+  try {
+    franka::GripperState measured_state = gripper->readOnce();
+    measured_gripper_width_m->store(measured_state.width, std::memory_order_release);
+    bool closing_stalled = false;
+    GripperState current_state = WidthToAnalogState(config, measured_state.width, closing_stalled);
+    active_gripper_state->store(current_state, std::memory_order_release);
+
+    auto set_state = [&](GripperState next_state) {
+      if (current_state == next_state) {
+        return;
+      }
+      current_state = next_state;
+      active_gripper_state->store(current_state, std::memory_order_release);
+    };
+
+    // Analog mode needs to respond to fine trigger motions. The XR device already
+    // has an effective coarse dead zone in the first half of travel, so do not
+    // reuse the binary-mode 2 mm command filter here.
+    const double min_delta_m = std::max(0.0, std::min(config.min_command_delta_m, 5e-4));
+    const double loop_rate_hz = std::max(config.max_command_rate_hz, 1.0);
+    const auto loop_sleep =
+        std::chrono::microseconds(static_cast<int64_t>(1e6 / loop_rate_hz));
+
+    while (!stop_requested->load(std::memory_order_acquire)) {
+      try {
+        measured_state = gripper->readOnce();
+      } catch (const std::exception& e) {
+        std::cerr << "Gripper analog read failed: " << e.what() << "\n";
+        std::this_thread::sleep_for(loop_sleep);
+        continue;
+      }
+
+      measured_gripper_width_m->store(measured_state.width, std::memory_order_release);
+      const double desired_width = ClampWidth(
+          config, desired_gripper_width_m->load(std::memory_order_acquire));
+      const double error = desired_width - measured_state.width;
+
+      if (closing_stalled) {
+        if (error > min_delta_m) {
+          closing_stalled = false;
+        } else {
+          set_state(WidthToAnalogState(config, measured_state.width, true));
+          std::this_thread::sleep_for(loop_sleep);
+          continue;
+        }
+      }
+
+      if (std::abs(error) <= min_delta_m) {
+        set_state(WidthToAnalogState(config, measured_state.width, false));
+        std::this_thread::sleep_for(loop_sleep);
+        continue;
+      }
+
+      const double command_width = desired_width;
+      const bool closing = error < 0.0;
+      const bool move_ok = gripper->move(command_width, config.speed_mps);
+      measured_state = gripper->readOnce();
+      measured_gripper_width_m->store(measured_state.width, std::memory_order_release);
+
+      if (closing) {
+        const bool blocked_before_target =
+            !move_ok &&
+            measured_state.width > (command_width + config.width_tolerance_m);
+        if (blocked_before_target) {
+          closing_stalled = true;
+          set_state(WidthToAnalogState(config, measured_state.width, true));
+          std::this_thread::sleep_for(loop_sleep);
+          continue;
+        }
+      }
+
+      set_state(WidthToAnalogState(config, measured_state.width, false));
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Gripper analog thread exception: " << e.what() << "\n";
+    stop_requested->store(true, std::memory_order_release);
+  } catch (...) {
+    std::cerr << "Gripper analog thread unknown exception\n";
+    stop_requested->store(true, std::memory_order_release);
+  }
+}
+
 void GripperLoop(franka::Gripper* gripper,
                  const GripperConfig& config,
                  const std::atomic<GripperState>* desired_gripper_state,
+                 const std::atomic<double>* desired_gripper_width_m,
                  std::atomic<GripperState>* active_gripper_state,
                  std::atomic<double>* measured_gripper_width_m,
                  std::atomic<bool>* stop_requested) {
+  if (config.command_mode == GripperCommandMode::kAnalog) {
+    GripperLoopAnalog(gripper,
+                      config,
+                      desired_gripper_width_m,
+                      active_gripper_state,
+                      measured_gripper_width_m,
+                      stop_requested);
+    return;
+  }
   try {
     franka::GripperState measured_state = gripper->readOnce();
     measured_gripper_width_m->store(measured_state.width, std::memory_order_release);
@@ -1321,9 +1534,12 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
     }
     franka::Model model = robot.loadModel();
 
-    if (!MoveToSafeHomeRoute(&robot, model, config_, stop_requested)) {
+    if (!MoveToSafeHomeRoute(&robot, config_, stop_requested)) {
       std::cerr << "Home move interrupted.\n";
       return 6;
+    }
+    if (gripper != nullptr) {
+      CommandGripperOpen(gripper.get(), config_.gripper, &measured_gripper_width_m);
     }
 
     LatestRobotStateBuffer robot_state_buffer;
@@ -1332,16 +1548,14 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
     const RobotSnapshot initial_robot_snapshot = ToSnapshot(robot.readOnce());
     robot_state_buffer.Publish(initial_robot_snapshot);
 
-    PlannedTarget initial_plan{};
-    initial_plan.target_timestamp_ns = MonotonicNowNs();
-    initial_plan.target_q = initial_robot_snapshot.q;
-    initial_plan.desired_tcp_pose = initial_robot_snapshot.tcp_pose;
-    initial_plan.target_gripper_width_m = config_.gripper.max_width_m;
-    initial_plan.control_mode = ControlMode::kHold;
-    initial_plan.teleop_state = TeleopState::kDisconnected;
-    planned_target_buffer.Publish(initial_plan);
+    PublishHoldTarget(
+        initial_robot_snapshot, config_.gripper.max_width_m, TeleopState::kDisconnected, &planned_target_buffer);
 
     std::atomic<GripperState> desired_gripper_state{GripperState::kOpen};
+    std::atomic<double> desired_gripper_width_m{config_.gripper.max_width_m};
+    std::atomic<uint64_t> requested_rehome_request_id{0};
+    std::atomic<uint64_t> completed_rehome_request_id{0};
+    std::atomic<bool> rehome_in_progress{false};
     const GripperState initial_gripper_state = !config_.gripper.enabled
                                                    ? GripperState::kOpen
                                                    : (gripper == nullptr
@@ -1364,6 +1578,10 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
                                  std::max<uint32_t>(1, options_.trace.planner_decimation),
                                  &active_gripper_state,
                                  &desired_gripper_state,
+                                 &desired_gripper_width_m,
+                                 &requested_rehome_request_id,
+                                 &completed_rehome_request_id,
+                                 &rehome_in_progress,
                                  stop_requested);
 
     if (gripper != nullptr && config_.allow_motion) {
@@ -1372,6 +1590,7 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
                                    gripper.get(),
                                    std::cref(config_.gripper),
                                    &desired_gripper_state,
+                                   &desired_gripper_width_m,
                                    &active_gripper_state,
                                    &measured_gripper_width_m,
                                    stop_requested);
@@ -1386,13 +1605,14 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
     uint64_t policy_tracking_fault_until_ns = 0;
     uint64_t policy_tracking_fault_accum_ns = 0;
     uint32_t cartesian_contact_cycles = 0;
-    uint64_t last_completed_rehome_request_id = 0;
-    uint64_t pending_rehome_request_id = 0;
-    uint32_t rehome_stop_settled_cycles = 0;
+    uint64_t last_completed_policy_rehome_request_id = 0;
+    uint64_t pending_policy_rehome_request_id = 0;
     JointPositionTrajectoryGenerator trajectory_generator(config_);
     const uint32_t rt_trace_decimation = std::max<uint32_t>(1, options_.trace.rt_decimation);
     while (!stop_requested->load(std::memory_order_acquire)) {
       try {
+        uint64_t pending_rehome_request_id = 0;
+        uint32_t rehome_settled_cycles = 0;
         robot.control([&](const franka::RobotState& state,
                           franka::Duration period) -> franka::JointPositions {
           const uint64_t now_ns = MonotonicNowNs();
@@ -1416,9 +1636,9 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
             const PolicyActionCommand policy_cmd = policy_action_buffer_->ReadLatest();
             const bool new_rehome_request =
                 policy_cmd.request_rehome && policy_cmd.operator_request_id != 0 &&
-                policy_cmd.operator_request_id > last_completed_rehome_request_id;
+                policy_cmd.operator_request_id > last_completed_policy_rehome_request_id;
             if (new_rehome_request) {
-              pending_rehome_request_id = policy_cmd.operator_request_id;
+              pending_policy_rehome_request_id = policy_cmd.operator_request_id;
             }
           }
 
@@ -1462,12 +1682,21 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
           }
           const bool recovery_inhibit_active = now_ns < motion_inhibit_until_ns;
           const bool policy_tracking_inhibit_active = now_ns < policy_tracking_fault_until_ns;
-          const bool apply_motion = config_.allow_motion && planned.teleop_active && planned.target_fresh &&
-                                    planned.control_mode != ControlMode::kHold &&
-                                    !collision_active &&
-                                    !sustained_cartesian_contact &&
-                                    !recovery_inhibit_active &&
-                                    !policy_tracking_inhibit_active;
+          const uint64_t requested_rehome_id =
+              requested_rehome_request_id.load(std::memory_order_acquire);
+          const uint64_t completed_rehome_id =
+              completed_rehome_request_id.load(std::memory_order_acquire);
+          if (pending_rehome_request_id == 0 && requested_rehome_id > completed_rehome_id) {
+            pending_rehome_request_id = requested_rehome_id;
+          }
+          const bool rehome_pending =
+              pending_rehome_request_id != 0 || pending_policy_rehome_request_id != 0;
+          const bool apply_motion =
+              config_.allow_motion && !rehome_pending && planned.teleop_active &&
+              planned.target_fresh && planned.control_mode != ControlMode::kHold &&
+              !collision_active && !sustained_cartesian_contact &&
+              !recovery_inhibit_active &&
+              !policy_tracking_inhibit_active;
 
           const double max_step = std::min(config_.ik.max_joint_step_rad,
                                            config_.ik.max_joint_velocity_radps * dt);
@@ -1476,14 +1705,23 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
           std::array<double, 7> filtered_delta{};
           std::array<double, 7> command_delta{};
           std::array<uint8_t, 7> clamp_saturated{};
-          const std::array<double, 7> q_cmd = trajectory_generator.Update(planned.target_q,
-                                                                          state.q_d,
-                                                                          dt,
-                                                                          apply_motion,
-                                                                          &target_delta,
-                                                                          &filtered_delta,
-                                                                          &command_delta,
-                                                                          &clamp_saturated);
+          std::array<double, 7> q_cmd{};
+          if (rehome_pending) {
+            q_cmd = state.q_d;
+            target_delta.fill(0.0);
+            filtered_delta.fill(0.0);
+            command_delta.fill(0.0);
+            clamp_saturated.fill(0);
+          } else {
+            q_cmd = trajectory_generator.Update(planned.target_q,
+                                                state.q_d,
+                                                dt,
+                                                apply_motion,
+                                                &target_delta,
+                                                &filtered_delta,
+                                                &command_delta,
+                                                &clamp_saturated);
+          }
           double max_abs_target_delta = 0.0;
           double max_abs_filtered_delta = 0.0;
           double max_abs_command_delta = 0.0;
@@ -1492,26 +1730,13 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
             max_abs_filtered_delta = std::max(max_abs_filtered_delta, std::abs(filtered_delta[i]));
             max_abs_command_delta = std::max(max_abs_command_delta, std::abs(command_delta[i]));
           }
-          bool rehome_stop_settled = pending_rehome_request_id != 0 && !apply_motion;
-          for (size_t i = 0; i < 7 && rehome_stop_settled; ++i) {
-            rehome_stop_settled =
-                rehome_stop_settled &&
-                std::abs(state.dq[i]) <= kRehomeStopVelocityToleranceRadPerS &&
-                std::abs(state.dq_d[i]) <= kRehomeStopVelocityToleranceRadPerS;
-          }
-          rehome_stop_settled =
-              rehome_stop_settled && max_abs_command_delta <= kRehomeStopCommandToleranceRad;
-          if (rehome_stop_settled) {
-            ++rehome_stop_settled_cycles;
-          } else {
-            rehome_stop_settled_cycles = 0;
-          }
           const Pose commanded_target_pose = MatrixToPose(
               model.pose(franka::Frame::kEndEffector, q_cmd, state.F_T_EE, state.EE_T_K));
 
           RobotObservation obs{};
           obs.timestamp_ns = now_ns;
           obs.q = state.q;
+          obs.q_cmd = q_cmd;
           obs.dq = state.dq;
           obs.tcp_pose = MatrixToPose(state.O_T_EE);
           obs.desired_target_tcp_pose = planned.desired_tcp_pose;
@@ -1567,9 +1792,23 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
           }
 
           franka::JointPositions out(q_cmd);
-          if (pending_rehome_request_id != 0 &&
-              rehome_stop_settled_cycles >= kRehomeStopSettledCycles) {
-            return franka::MotionFinished(out);
+          if (rehome_pending && !apply_motion) {
+            bool settled = max_abs_command_delta <= kRehomeStopCommandToleranceRad;
+            for (size_t i = 0; i < 7 && settled; ++i) {
+              settled = settled &&
+                        std::abs(state.dq[i]) <= kRehomeStopVelocityToleranceRadPerS &&
+                        std::abs(state.dq_d[i]) <= kRehomeStopVelocityToleranceRadPerS;
+            }
+            if (settled) {
+              ++rehome_settled_cycles;
+            } else {
+              rehome_settled_cycles = 0;
+            }
+            if (rehome_settled_cycles >= kRehomeStopSettledCycles) {
+              return franka::MotionFinished(out);
+            }
+          } else {
+            rehome_settled_cycles = 0;
           }
           if (stop_requested->load(std::memory_order_acquire)) {
             return franka::MotionFinished(out);
@@ -1579,9 +1818,12 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
                       franka::ControllerMode::kJointImpedance,
                       config_.limit_rate,
                       config_.lpf_cutoff_frequency);
-        if (pending_rehome_request_id != 0) {
-          const uint64_t request_id = pending_rehome_request_id;
-          pending_rehome_request_id = 0;
+        if (stop_requested->load(std::memory_order_acquire)) {
+          break;
+        }
+        if (pending_policy_rehome_request_id != 0) {
+          const uint64_t request_id = pending_policy_rehome_request_id;
+          pending_policy_rehome_request_id = 0;
           std::cerr << "Processing policy re-home request id=" << request_id << "\n";
           if (!RecoverRobotIfNeeded(&robot)) {
             std::cerr << "Failed to recover robot before re-home.\n";
@@ -1589,17 +1831,17 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
           }
           trajectory_generator.Reset();
           rt_last_ns = 0;
+          last_success_rate_log_ns = 0;
           cartesian_contact_cycles = 0;
-          rehome_stop_settled_cycles = 0;
-          if (!MoveToSafeHomeRoute(&robot, model, config_, stop_requested)) {
+          if (!MoveToSafeHomeRoute(&robot, config_, stop_requested)) {
             if (stop_requested->load(std::memory_order_acquire)) {
               break;
             }
             std::cerr << "Runtime re-home interrupted.\n";
             return 6;
           }
-          last_completed_rehome_request_id = request_id;
-          motion_inhibit_until_ns = MonotonicNowNs() + 400000000ull;  // 400 ms settle window
+          last_completed_policy_rehome_request_id = request_id;
+          motion_inhibit_until_ns = MonotonicNowNs() + kPostRehomeMotionInhibitNs;
           const RobotSnapshot home_snapshot = ToSnapshot(robot.readOnce());
           robot_state_buffer.Publish(home_snapshot);
           PlannedTarget hold_target = planned_target_buffer.ReadLatest();
@@ -1614,6 +1856,37 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
           std::cerr << "Completed policy re-home request id=" << request_id << "\n";
           continue;
         }
+        if (pending_rehome_request_id != 0) {
+          rehome_in_progress.store(true, std::memory_order_release);
+          if (!RecoverRobotIfNeeded(&robot)) {
+            std::cerr << "Failed to recover robot before rehome.\n";
+            return 5;
+          }
+          trajectory_generator.Reset();
+          rt_last_ns = 0;
+          last_success_rate_log_ns = 0;
+          cartesian_contact_cycles = 0;
+          if (!MoveToSafeHomeRoute(&robot, config_, stop_requested)) {
+            rehome_in_progress.store(false, std::memory_order_release);
+            if (stop_requested->load(std::memory_order_acquire)) {
+              break;
+            }
+            std::cerr << "Runtime rehome interrupted.\n";
+            return 6;
+          }
+          desired_gripper_state.store(GripperState::kOpen, std::memory_order_release);
+          desired_gripper_width_m.store(config_.gripper.max_width_m, std::memory_order_release);
+          const RobotSnapshot home_snapshot = ToSnapshot(robot.readOnce());
+          robot_state_buffer.Publish(home_snapshot);
+          completed_rehome_request_id.store(pending_rehome_request_id, std::memory_order_release);
+          motion_inhibit_until_ns = MonotonicNowNs() + kPostRehomeMotionInhibitNs;
+          PublishHoldTarget(home_snapshot,
+                            config_.gripper.max_width_m,
+                            TeleopState::kConnectedIdle,
+                            &planned_target_buffer);
+          rehome_in_progress.store(false, std::memory_order_release);
+          continue;
+        }
         break;
       } catch (const franka::ControlException& e) {
         const std::string what = e.what();
@@ -1624,8 +1897,7 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
         try {
           robot.automaticErrorRecovery();
           trajectory_generator.Reset();
-          rehome_stop_settled_cycles = 0;
-          motion_inhibit_until_ns = MonotonicNowNs() + 400000000ull;  // 400 ms settle window
+          motion_inhibit_until_ns = MonotonicNowNs() + kPostRehomeMotionInhibitNs;
           std::cerr << "Recovered from reflex; continuing teleop after brief hold.\n";
         } catch (const std::exception& recovery_error) {
           std::cerr << "Automatic error recovery failed: " << recovery_error.what() << "\n";

@@ -15,9 +15,10 @@
     "timestamp_ns": {"type": "integer", "minimum": 0},
     "robot_state": {
       "type": "object",
-      "required": ["q", "dq", "tcp_position_xyz", "tcp_orientation_xyzw", "gripper_width", "gripper_state"],
+      "required": ["q", "q_cmd", "dq", "tcp_position_xyz", "tcp_orientation_xyzw", "gripper_width", "gripper_state"],
       "properties": {
         "q": {"type": "array", "items": {"type": "number"}, "minItems": 7, "maxItems": 7},
+        "q_cmd": {"type": "array", "items": {"type": "number"}, "minItems": 7, "maxItems": 7},
         "dq": {"type": "array", "items": {"type": "number"}, "minItems": 7, "maxItems": 7},
         "tcp_position_xyz": {
           "type": "array",

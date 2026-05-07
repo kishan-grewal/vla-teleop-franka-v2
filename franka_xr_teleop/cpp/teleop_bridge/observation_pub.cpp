@@ -64,6 +64,9 @@ std::string ObservationPublisher::ToJson(const RobotObservation& obs) const {
   ss << "\"q\":";
   AppendArray(&ss, obs.q);
   ss << ',';
+  ss << "\"q_cmd\":";
+  AppendArray(&ss, obs.q_cmd);
+  ss << ',';
   ss << "\"dq\":";
   AppendArray(&ss, obs.dq);
   ss << ',';

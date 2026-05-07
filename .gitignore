@@ -44,6 +44,7 @@ venv/
 # Recordings
 recordings/
 franka_xr_teleop/recordings/
+recordings_backfilled/
 
 # VLA models
 model/

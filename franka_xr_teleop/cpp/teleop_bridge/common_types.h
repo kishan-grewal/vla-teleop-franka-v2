@@ -209,6 +209,7 @@ struct PlannedTarget {
 struct RobotObservation {
   uint64_t timestamp_ns = 0;
   std::array<double, 7> q{};
+  std::array<double, 7> q_cmd{};
   std::array<double, 7> dq{};
   Pose tcp_pose{};
   Pose desired_target_tcp_pose{};
@@ -238,6 +239,7 @@ struct SafetyLimits {
   double jump_reject_rotation_rad = 0.80;
   std::array<double, 3> workspace_min{{0.20, -0.45, 0.05}};
   std::array<double, 3> workspace_max{{0.80, 0.45, 0.85}};
+  bool enforce_workspace_limits_during_rehome = true;
 };
 
 struct TeleopRuntimeConfig {

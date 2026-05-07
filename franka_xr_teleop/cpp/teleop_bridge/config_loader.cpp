@@ -82,6 +82,9 @@ bool LoadSafetyConfig(const std::string& path, AppConfig* config, std::string* e
   ReadScalar(safety, "jump_reject_rotation_rad", &config->bridge.safety.jump_reject_rotation_rad);
   ReadArray(safety, "workspace_min_xyz", &config->bridge.safety.workspace_min);
   ReadArray(safety, "workspace_max_xyz", &config->bridge.safety.workspace_max);
+  ReadScalar(safety,
+             "enforce_workspace_limits_during_rehome",
+             &config->bridge.safety.enforce_workspace_limits_during_rehome);
   return true;
 }
 
@@ -410,6 +413,24 @@ bool LoadAppConfig(const std::string& config_dir, AppConfig* config, std::string
   if (config->bridge.safety.max_step_rotation_rad <= 0.0) {
     *error = "safety.max_step_rotation_rad must be > 0";
     return false;
+  }
+  if (config->bridge.safety.packet_timeout_s <= 0.0) {
+    *error = "safety.packet_timeout_s must be > 0";
+    return false;
+  }
+  if (config->bridge.safety.jump_reject_translation_m <= 0.0) {
+    *error = "safety.jump_reject_translation_m must be > 0";
+    return false;
+  }
+  if (config->bridge.safety.jump_reject_rotation_rad <= 0.0) {
+    *error = "safety.jump_reject_rotation_rad must be > 0";
+    return false;
+  }
+  for (size_t i = 0; i < config->bridge.safety.workspace_min.size(); ++i) {
+    if (config->bridge.safety.workspace_min[i] > config->bridge.safety.workspace_max[i]) {
+      *error = "safety.workspace_min_xyz must be <= safety.workspace_max_xyz on every axis";
+      return false;
+    }
   }
   if (config->bridge.ik.max_joint_acceleration_radps2 <= 0.0) {
     *error = "teleop.ik.max_joint_acceleration_radps2 must be > 0";

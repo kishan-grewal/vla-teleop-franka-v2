@@ -7,37 +7,63 @@ robot:
   with_receive_metadata: false
   flush_every: 50
   fsync_every: 0
-  print_hz: 1.0
+  print_hz: 0.1
 
-zed:
-  enabled: true
-  camera_name: ee_zed_m
-  left_camera_name: ee_zed_m_left
-  right_camera_name: ee_zed_m_right
-  serial: 0
-  resolution: HD720
-  fps: 30
-  width: 0
-  height: 0
-  exposure: 70
-  auto_exposure: false
-  svo: false
-  svo_compression: H264
-  depth: false
-  video_codec: mp4v
-  print_hz: 1.0
+cameras:
+  - id: third_person
+    enabled: true
+    backend: realsense
+    role: third_person
+    camera_name: third_person_d405
+    serial: "128422271175"
+    color_width: 1280
+    color_height: 720
+    depth_width: 640
+    depth_height: 480
+    fps: 30
+    exposure: 12000
+    auto_exposure: false
+    depth: false
+    align_depth: true
+    bag: false
+    video_codec: mp4v
+    print_hz: 0.1
 
-realsense:
-  enabled: true
-  camera_name: third_person_d405
-  serial: "128422271175"
-  color_width: 1280
-  color_height: 720
-  depth_width: 640
-  depth_height: 480
-  fps: 30
-  depth: false
-  align_depth: true
-  bag: false
-  video_codec: mp4v
-  print_hz: 1.0
+  - id: wrist
+    enabled: true
+    backend: realsense
+    role: wrist
+    camera_name: wrist_d405
+    serial: "128422271845"
+    color_width: 1280
+    color_height: 720
+    depth_width: 640
+    depth_height: 480
+    fps: 30
+    exposure: 12000
+    auto_exposure: false
+    depth: false
+    align_depth: true
+    bag: false
+    video_codec: mp4v
+    print_hz: 0.1
+
+  - id: zed_wrist
+    enabled: false
+    backend: zed
+    role: wrist
+    camera_name: ee_zed_m
+    left_camera_name: ee_zed_m_left
+    right_camera_name: ee_zed_m_right
+    serial: 0
+    resolution: HD720
+    fps: 30
+    width: 0
+    height: 0
+    exposure: 70
+    auto_exposure: false
+    svo: false
+    svo_compression: H264
+    depth: false
+    video_codec: mp4v
+    print_hz: 1.0

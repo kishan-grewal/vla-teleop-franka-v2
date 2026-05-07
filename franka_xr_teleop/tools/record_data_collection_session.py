@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Launch synchronized robot, ZED, and RealSense data recorders."""
+"""Launch synchronized robot and camera data recorders."""
 
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 
@@ -39,7 +38,7 @@ def default_config_path() -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Start the robot UDP recorder, ZED recorder, and RealSense recorder "
+            "Start the robot UDP recorder and configured camera recorders "
             "for one dataset collection session."
         )
     )
@@ -54,15 +53,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recording-root", type=Path, default=None)
     parser.add_argument("--duration-s", type=float, default=0.0, help="Stop all recorders after seconds; 0 until Ctrl-C.")
     parser.add_argument("--robot-port", type=int, default=None)
-    parser.add_argument("--zed-serial", type=int, default=None)
-    parser.add_argument("--realsense-serial", default=None)
     parser.add_argument("--disable-robot", action="store_true")
-    parser.add_argument("--disable-zed", action="store_true")
-    parser.add_argument("--disable-realsense", action="store_true")
-    parser.add_argument("--zed-svo", action="store_true", help="Force ZED SVO recording on.")
-    parser.add_argument("--zed-depth", action="store_true", help="Force ZED depth recording on.")
-    parser.add_argument("--realsense-bag", action="store_true", help="Force RealSense .bag recording on.")
-    parser.add_argument("--realsense-depth", action="store_true", help="Force RealSense depth recording on.")
+    parser.add_argument(
+        "--disable-camera",
+        action="append",
+        default=[],
+        metavar="CAMERA",
+        help="Disable a configured camera by id or camera_name. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--enable-camera",
+        action="append",
+        default=[],
+        metavar="CAMERA",
+        help="Enable a configured camera by id or camera_name. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--camera-serial",
+        action="append",
+        default=[],
+        metavar="CAMERA=SERIAL",
+        help="Override a configured camera serial by id or camera_name. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--camera-depth",
+        action="append",
+        default=[],
+        metavar="CAMERA",
+        help="Force depth recording for a configured camera. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--camera-raw",
+        action="append",
+        default=[],
+        metavar="CAMERA",
+        help="Force backend raw recording for a camera: ZED .svo or RealSense .bag.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands and session metadata without launching.")
     return parser.parse_args()
 
@@ -84,6 +110,26 @@ def section(config: Dict[str, Any], key: str) -> Dict[str, Any]:
     return value
 
 
+def camera_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    value = config.get("cameras", [])
+    if not isinstance(value, list):
+        raise ValueError("config.cameras must be a list")
+
+    cameras: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    for index, raw_camera in enumerate(value):
+        if not isinstance(raw_camera, dict):
+            raise ValueError(f"config.cameras[{index}] must be a map")
+        camera = dict(raw_camera)
+        camera_id = str(camera.get("id") or camera.get("camera_name") or f"camera_{index}")
+        if camera_id in seen_ids:
+            raise ValueError(f"Duplicate camera id in config.cameras: {camera_id}")
+        seen_ids.add(camera_id)
+        camera["id"] = camera_id
+        cameras.append(camera)
+    return cameras
+
+
 def resolve_repo_path(path: Path) -> Path:
     if path.is_absolute():
         return path
@@ -92,6 +138,40 @@ def resolve_repo_path(path: Path) -> Path:
 
 def bool_value(config: Dict[str, Any], key: str, default: bool = False) -> bool:
     return bool(config.get(key, default))
+
+
+def parse_key_value_overrides(values: List[str], flag: str) -> Dict[str, str]:
+    overrides: Dict[str, str] = {}
+    for value in values:
+        key, sep, override = value.partition("=")
+        if not sep or not key:
+            raise ValueError(f"{flag} expects CAMERA=VALUE; got {value!r}")
+        overrides[key] = override
+    return overrides
+
+
+def camera_keys(cfg: Dict[str, Any]) -> Set[str]:
+    keys = {str(cfg["id"])}
+    for key in ("camera_name", "left_camera_name", "right_camera_name"):
+        value = cfg.get(key)
+        if value not in (None, ""):
+            keys.add(str(value))
+    return keys
+
+
+def matches_camera(cfg: Dict[str, Any], names: Set[str]) -> bool:
+    return bool(camera_keys(cfg) & names)
+
+
+def camera_override_value(cfg: Dict[str, Any], overrides: Dict[str, str]) -> Optional[str]:
+    for key in camera_keys(cfg):
+        if key in overrides:
+            return overrides[key]
+    return None
+
+
+def unknown_camera_names(cameras: List[Dict[str, Any]], names: Set[str]) -> List[str]:
+    return sorted(name for name in names if not any(matches_camera(camera, {name}) for camera in cameras))
 
 
 def add_flag(cmd: List[str], enabled: bool, flag: str) -> None:
@@ -150,12 +230,12 @@ def build_zed_command(
     cfg: Dict[str, Any],
     session_dir: Path,
     duration_s: float,
-    zed_serial: Optional[int],
+    serial_override: Optional[str],
     force_svo: bool,
     force_depth: bool,
 ) -> List[str]:
     if cfg.get("exposure") not in (None, -1) and bool_value(cfg, "auto_exposure", False):
-        raise ValueError("config.zed.exposure and config.zed.auto_exposure cannot both be set")
+        raise ValueError(f"config.cameras[{cfg['id']}].exposure and auto_exposure cannot both be set")
     cmd = [str(script_dir() / "record_zed_camera.py")]
     camera_name = cfg.get("camera_name", "ee_zed_m")
     left_camera_name = cfg.get("left_camera_name", f"{camera_name}_left")
@@ -166,7 +246,7 @@ def build_zed_command(
     add_option(cmd, "--right-camera-name", right_camera_name)
     add_option(cmd, "--left-output-dir", session_dir / "cameras" / str(left_camera_name))
     add_option(cmd, "--right-output-dir", session_dir / "cameras" / str(right_camera_name))
-    add_option(cmd, "--serial", zed_serial if zed_serial is not None else cfg.get("serial", 0))
+    add_option(cmd, "--serial", serial_override if serial_override is not None else cfg.get("serial", 0))
     add_option(cmd, "--resolution", cfg.get("resolution", "HD720"))
     add_option(cmd, "--fps", cfg.get("fps", 30))
     add_option(cmd, "--width", cfg.get("width", 0))
@@ -186,15 +266,18 @@ def build_realsense_command(
     cfg: Dict[str, Any],
     session_dir: Path,
     duration_s: float,
-    serial: Optional[str],
+    serial_override: Optional[str],
     force_bag: bool,
     force_depth: bool,
 ) -> List[str]:
+    if cfg.get("exposure") not in (None, -1) and bool_value(cfg, "auto_exposure", False):
+        raise ValueError(f"config.cameras[{cfg['id']}].exposure and auto_exposure cannot both be set")
     cmd = [str(script_dir() / "record_realsense_camera.py")]
     camera_name = cfg.get("camera_name", "third_person_d405")
     add_option(cmd, "--camera-name", camera_name)
+    add_option(cmd, "--role", cfg.get("role", "third_person"))
     add_option(cmd, "--output-dir", session_dir / "cameras" / str(camera_name))
-    add_option(cmd, "--serial", serial if serial is not None else cfg.get("serial", ""))
+    add_option(cmd, "--serial", serial_override if serial_override is not None else cfg.get("serial", ""))
     add_option(cmd, "--color-width", cfg.get("color_width", 1280))
     add_option(cmd, "--color-height", cfg.get("color_height", 720))
     add_option(cmd, "--depth-width", cfg.get("depth_width", 640))
@@ -203,10 +286,32 @@ def build_realsense_command(
     add_option(cmd, "--duration-s", duration_s)
     add_option(cmd, "--video-codec", cfg.get("video_codec", "mp4v"))
     add_option(cmd, "--print-hz", cfg.get("print_hz", 1.0))
+    add_option(cmd, "--exposure", cfg.get("exposure"))
+    add_flag(cmd, bool_value(cfg, "auto_exposure", False), "--auto-exposure")
     add_flag(cmd, bool_value(cfg, "depth", False) or force_depth, "--depth")
     add_flag(cmd, not bool_value(cfg, "align_depth", True), "--no-align-depth")
     add_flag(cmd, bool_value(cfg, "bag", False) or force_bag, "--bag")
     return cmd
+
+
+def build_camera_command(
+    cfg: Dict[str, Any],
+    session_dir: Path,
+    duration_s: float,
+    serial_overrides: Dict[str, str],
+    depth_overrides: Set[str],
+    raw_overrides: Set[str],
+) -> List[str]:
+    backend = str(cfg.get("backend", "")).lower()
+    serial_override = camera_override_value(cfg, serial_overrides)
+    force_depth = matches_camera(cfg, depth_overrides)
+    force_raw = matches_camera(cfg, raw_overrides)
+
+    if backend == "zed":
+        return build_zed_command(cfg, session_dir, duration_s, serial_override, force_raw, force_depth)
+    if backend == "realsense":
+        return build_realsense_command(cfg, session_dir, duration_s, serial_override, force_raw, force_depth)
+    raise ValueError(f"config.cameras[{cfg['id']}].backend must be 'zed' or 'realsense'; got {backend!r}")
 
 
 def print_command(name: str, cmd: List[str]) -> None:
@@ -234,6 +339,11 @@ def main() -> int:
     if args.duration_s < 0.0:
         print("--duration-s must be >= 0", file=sys.stderr)
         return 2
+    try:
+        serial_overrides = parse_key_value_overrides(args.camera_serial, "--camera-serial")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -243,30 +353,45 @@ def main() -> int:
     recording_root = resolve_repo_path(args.recording_root or Path(config.get("recording_root", "recordings")))
     recording_id = args.recording_id or session_id_from_time()
     session_dir = recording_root / recording_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "cameras").mkdir(exist_ok=True)
 
     commands: Dict[str, List[str]] = {}
     robot_cfg = section(config, "robot")
-    zed_cfg = section(config, "zed")
-    realsense_cfg = section(config, "realsense")
+    cameras = camera_configs(config)
+    disabled_cameras = set(args.disable_camera)
+    enabled_cameras = set(args.enable_camera)
+    depth_overrides = set(args.camera_depth)
+    raw_overrides = set(args.camera_raw)
+    unknown_names = (
+        unknown_camera_names(cameras, disabled_cameras)
+        + unknown_camera_names(cameras, enabled_cameras)
+        + unknown_camera_names(cameras, depth_overrides)
+        + unknown_camera_names(cameras, raw_overrides)
+        + unknown_camera_names(cameras, set(serial_overrides))
+    )
+    if unknown_names:
+        print("Unknown configured camera name(s): " + ", ".join(sorted(set(unknown_names))), file=sys.stderr)
+        return 2
 
     if bool_value(robot_cfg, "enabled", True) and not args.disable_robot:
         commands["robot"] = build_robot_command(robot_cfg, session_dir, args.duration_s, args.robot_port)
-    if bool_value(zed_cfg, "enabled", True) and not args.disable_zed:
-        commands["zed"] = build_zed_command(
-            zed_cfg, session_dir, args.duration_s, args.zed_serial, args.zed_svo, args.zed_depth
-        )
-    if bool_value(realsense_cfg, "enabled", True) and not args.disable_realsense:
-        commands["realsense"] = build_realsense_command(
-            realsense_cfg,
+    for camera in cameras:
+        explicitly_enabled = matches_camera(camera, enabled_cameras)
+        explicitly_disabled = matches_camera(camera, disabled_cameras)
+        if explicitly_disabled and not explicitly_enabled:
+            continue
+        if not (bool_value(camera, "enabled", True) or explicitly_enabled):
+            continue
+        commands[f"camera:{camera['id']}"] = build_camera_command(
+            camera,
             session_dir,
             args.duration_s,
-            args.realsense_serial,
-            args.realsense_bag,
-            args.realsense_depth,
+            serial_overrides,
+            depth_overrides,
+            raw_overrides,
         )
 
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "cameras").mkdir(exist_ok=True)
     write_session_metadata(session_dir, args, config_path, config, commands)
 
     print(f"session_dir={session_dir}", flush=True)

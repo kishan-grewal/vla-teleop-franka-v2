@@ -7,7 +7,7 @@ teleop:
   dry_run: false
   a_button_toggles_robot_control: false
   control_mode: pose
-  scale_factor: 1.3
+  scale_factor: 1
   rotation_scale_factor: 0.5
   control_trigger_threshold: 0.9
   control_trigger_release_threshold: 0.8
@@ -19,7 +19,7 @@ teleop:
   xr_hold_release_multiplier: 2.5
   xr_hold_dwell_s: 0.12
   planner_rate_hz: 100.0
-  start_joint_positions_rad: [-0.03172855768968763, -1.063935324983971, 0.07933473784803836, -2.86077989514297, 0.05852869658116116, 2.345908166150277, 0.8116081573698255]
+  start_joint_positions_rad: [-0.03172855768968763, -0.3, 0.07933473784803836, -2.45, 0.05852869658116116, 2.1, 0.8116081573698255]
   policy:
     bind_ip: 0.0.0.0
     action_port: 28082
@@ -32,7 +32,7 @@ teleop:
     tracking_inhibit_s: 0.75
   ik:
     damping: 0.08
-    nullspace_gain: 0.15
+    nullspace_gain: 0.75
     nullspace_joint_positions_rad: [0, -0.795, 0, -2.356, 0, 1.571, 0.785]
     planner_substeps: 8
     max_joint_velocity_radps: 1.5
@@ -64,6 +64,6 @@ teleop:
     toggle_debounce_s: 0.30
     stall_width_delta_m: 0.001
     stall_timeout_s: 0.25
-    width_tolerance_m: 0.002
+    width_tolerance_m: 0.0005
     read_failure_timeout_s: 0.50
     grasp_force_n: 20.0

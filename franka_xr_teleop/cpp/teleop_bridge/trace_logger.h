@@ -150,4 +150,3 @@ class TraceRecorder {
 };
 
 }  // namespace teleop
-

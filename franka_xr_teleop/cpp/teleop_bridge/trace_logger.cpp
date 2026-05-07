@@ -269,4 +269,3 @@ void TraceRecorder::WriteRtRow(const RtTraceSample& sample) {
 }
 
 }  // namespace teleop
-

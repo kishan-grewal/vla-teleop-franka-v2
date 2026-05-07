@@ -40,6 +40,10 @@ a ZED SDK backup for later re-extraction.
 The robot UDP observation packet includes `timestamp_ns`, stamped on the host
 with a monotonic clock in the robot control callback.
 
+For joint-space learning or analysis, `robot_state.q` is the measured joint
+state and `robot_state.q_cmd` is the post-smoothing IK joint command that was
+actually sent toward the robot in the realtime loop.
+
 The ZED recorder logs each frame with `host_timestamp_ns`, also using the same
 host monotonic clock. Since the ZED is plugged into the same host computer, these
 timestamps can be matched directly for frame-level sync.
@@ -110,10 +114,11 @@ When `teleop.a_button_toggles_robot_control: false`, press the Oculus
 right-controller A button to mark episode start and B to mark episode end. The
 bridge emits one-shot `status.episode_start` / `status.episode_end` markers in
 the UDP observation stream, and the recorder writes corresponding rows to the
-events output file.
+events output file. After the `episode_end` marker is emitted, the bridge also
+opens the gripper and runs the full rehome route before the next episode.
 
 If `teleop.a_button_toggles_robot_control: true`, the bridge leaves A alone and
-falls back to the legacy behavior where B emits only `episode_start`.
+still uses B as `episode_end` plus rehome.
 
 Optional flags:
 
@@ -139,21 +144,21 @@ Record the wrist/end-effector camera:
 Outputs:
 
 - `../ee_zed_m_left/rgb.mp4`: compressed left-eye RGB video for playback and
-  labeling.
+labeling.
 - `../ee_zed_m_left/frames.jsonl`: one row per left-eye frame with
-  `host_timestamp_ns`.
+`host_timestamp_ns`.
 - `../ee_zed_m_left/metadata.json`: left virtual camera metadata and
-  calibration fields.
+calibration fields.
 - `../ee_zed_m_right/rgb.mp4`: compressed right-eye RGB video for playback and
-  labeling.
+labeling.
 - `../ee_zed_m_right/frames.jsonl`: one row per right-eye frame with the same
-  synchronized timestamps and frame indices as the left view.
+synchronized timestamps and frame indices as the left view.
 - `../ee_zed_m_right/metadata.json`: right virtual camera metadata and
-  calibration fields.
+calibration fields.
 - `raw.svo`: optional shared ZED raw recording under `cameras/ee_zed_m/` when
-  `--svo` is enabled.
+`--svo` is enabled.
 - `../ee_zed_m_left/depth/`: optional metric depth frames aligned to the left
-  virtual camera when `--depth` is enabled.
+virtual camera when `--depth` is enabled.
 
 Useful flags:
 
@@ -182,6 +187,7 @@ Record the third-person camera:
 ./tools/record_realsense_camera.py \
   --camera-name third_person_d405 \
   --serial <D405_SERIAL> \
+  --exposure <RGB_EXPOSURE> \
   --output-dir recordings/session_001/cameras/third_person_d405
 ```
 
@@ -189,9 +195,9 @@ Outputs:
 
 - `rgb.mp4`: compressed RGB video for playback and labeling.
 - `frames.jsonl`: one row per frame with `host_timestamp_ns` and video frame
-  index.
+index.
 - `metadata.json`: RealSense stream profiles, intrinsics, depth scale, and
-  device metadata.
+device metadata.
 - `raw.bag`: optional RealSense SDK recording when `--bag` is enabled.
 - `depth/`: optional depth frames when `--depth` is enabled.
 
@@ -200,9 +206,11 @@ Useful flags:
 - `--depth`: save per-frame `z16` depth as compressed NPZ files.
 - `--bag`: keep a RealSense `.bag` backup for SDK playback/re-extraction.
 - `--color-width 1280 --color-height 720 --fps 30`: set RGB stream mode.
+- `--exposure N`: set manual RGB exposure on the RealSense color sensor.
+- `--auto-exposure` or `--exposure -1`: restore automatic RGB exposure.
 - `--depth-width 640 --depth-height 480`: set depth stream mode.
 - `--no-align-depth`: keep depth in its native frame instead of aligning it to
-  color.
+color.
 
 ## Align Robot And Camera Data
 
@@ -216,7 +224,6 @@ After recording, build aligned training samples:
   --camera third_person_d405 recordings/session_001/cameras/third_person_d405/frames.jsonl \
   --output recordings/session_001/aligned_samples.jsonl
 ```
-
 The aligner nearest-neighbor matches each robot `timestamp_ns` to each camera's
 `host_timestamp_ns`.
 
