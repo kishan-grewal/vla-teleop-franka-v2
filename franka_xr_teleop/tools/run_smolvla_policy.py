@@ -270,6 +270,48 @@ class KeyboardMonitor:
         return chars
 
 
+class LiveTuningReceiver:
+    def __init__(self, port: int, defaults: dict[str, float]) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.settimeout(0.05)
+        self._sock.bind(("127.0.0.1", port))
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._values: dict[str, float] = dict(defaults)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._sock.close()
+
+    def get(self, key: str) -> float:
+        with self._lock:
+            return self._values[key]
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                payload, _addr = self._sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            try:
+                data = json.loads(payload.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            with self._lock:
+                for k, v in data.items():
+                    if k in self._values:
+                        self._values[k] = float(v)
+                        print(f"Tuning: {k}={v}", flush=True)
+
+
 class ZedStereoCamera:
     def __init__(self, serial: int, resolution: str, fps: int) -> None:
         cv2, _np, sl = import_zed_dependencies()
@@ -912,6 +954,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Hold the current measured joint configuration without loading any policy; useful for bridge smoke tests.",
     )
+    parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "Exponential moving average coefficient for joint targets (0 < alpha <= 1.0). "
+            "Lower values mean more smoothing; 1.0 disables EMA entirely (passthrough)."
+        ),
+    )
+    parser.add_argument(
+        "--tuning-port",
+        type=int,
+        default=None,
+        help=(
+            "When provided, start a UDP listener on this port for live parameter updates. "
+            "Accepted keys: ema_alpha. "
+            "Example: echo '{\"ema_alpha\": 0.3}' | nc -u -w1 127.0.0.1 28090"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -928,6 +989,8 @@ def main() -> int:
         raise ValueError("--config is required unless --zero-actions is set")
     if args.camera_preview_samples <= 0:
         raise ValueError("--camera-preview-samples must be > 0")
+    if not (0.0 < args.ema_alpha <= 1.0):
+        raise ValueError("--ema-alpha must be in (0, 1]")
 
     deployment_config: dict[str, Any] = {}
     if args.config is not None:
@@ -944,6 +1007,16 @@ def main() -> int:
     dst = (args.bridge_ip, args.action_port)
     period_s = 1.0 / args.rate_hz
     keyboard = KeyboardMonitor()
+
+    tuner: LiveTuningReceiver | None = None
+    if args.tuning_port is not None:
+        tuner = LiveTuningReceiver(port=args.tuning_port, defaults={"ema_alpha": args.ema_alpha})
+        tuner.start()
+        print(f"Live tuning receiver active on udp://127.0.0.1:{args.tuning_port}", flush=True)
+    ema_prev_joints: np.ndarray | None = None
+
+    def get_ema_alpha() -> float:
+        return tuner.get("ema_alpha") if tuner is not None else args.ema_alpha
 
     policy = None
     preprocess = None
@@ -1077,9 +1150,11 @@ def main() -> int:
                 normalized = key.lower()
                 if normalized == "p":
                     operator_paused = True
+                    ema_prev_joints = None
                     print("Policy paused by operator.", flush=True)
                 elif normalized == "h":
                     operator_paused = True
+                    ema_prev_joints = None
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
                     print(
@@ -1129,6 +1204,11 @@ def main() -> int:
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
 
             action, gripper_command, clamp_info = _clamp_action_with_info(raw_action)
+            alpha = get_ema_alpha()
+            ema_applied = ema_prev_joints is not None and not operator_paused and alpha < 1.0
+            if ema_applied:
+                action[:JOINT_ACTION_DIM] = alpha * action[:JOINT_ACTION_DIM] + (1.0 - alpha) * ema_prev_joints
+            ema_prev_joints = action[:JOINT_ACTION_DIM].copy()
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
@@ -1144,6 +1224,8 @@ def main() -> int:
                 "gripper_command": gripper_command,
                 "raw_joint_positions_rad": _jsonable_action(raw_action),
                 "clamped_joint_positions_rad": _jsonable_action(action),
+                "ema_alpha": alpha,
+                "ema_applied": ema_applied,
                 **clamp_info,
             })
             _send_action(
@@ -1166,6 +1248,8 @@ def main() -> int:
         return 0
     finally:
         keyboard.stop()
+        if tuner is not None:
+            tuner.stop()
         obs_rx.stop()
         action_sock.close()
         if action_log is not None:
