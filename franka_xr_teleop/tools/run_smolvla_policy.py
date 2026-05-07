@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import dataclass
 import json
 import select
 import socket
@@ -23,9 +24,6 @@ from record_zed_camera import timestamp_to_ns as zed_timestamp_to_ns
 
 
 OBS_STATE_KEY = "observation.state"
-TOP_IMAGE_KEY = "observation.images.top"
-RIGHT_ZED_IMAGE_KEY = "observation.images.ee_zed_m_right"
-THIRD_PERSON_IMAGE_KEY = "observation.images.third_person_d405"
 ACTION_KEY = "action"
 JOINT_ACTION_DIM = 7
 POLICY_ACTION_DIM = 8
@@ -80,6 +78,100 @@ if "termios" not in globals():
     termios = None  # type: ignore[assignment]
 if "tty" not in globals():
     tty = None  # type: ignore[assignment]
+
+
+@dataclass
+class _CameraSource:
+    obs_key: str
+    camera: Any  # RealSenseColorCamera or ZedStereoCamera
+    zed_view: str | None  # None for RealSense; "left"/"right" for ZED
+    target_hw: tuple[int, int]
+
+
+def _load_yaml_config(path: Path) -> dict[str, Any]:
+    import yaml
+    with path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _obs_keys_from_config(config: dict[str, Any]) -> tuple[str, ...]:
+    keys: list[str] = []
+    for cam_cfg in config.get("cameras", []):
+        if not cam_cfg.get("enabled", True):
+            continue
+        backend = str(cam_cfg.get("backend", "realsense"))
+        if backend == "realsense":
+            if obs_key := cam_cfg.get("obs_key"):
+                keys.append(obs_key)
+        elif backend == "zed":
+            for attr in ("obs_key_left", "obs_key_right"):
+                if obs_key := cam_cfg.get(attr):
+                    keys.append(obs_key)
+    return tuple(keys)
+
+
+def _build_camera_sources(
+    config: dict[str, Any],
+    policy: Any | None,
+    fallback_hw: tuple[int, int],
+) -> list[_CameraSource]:
+    sources: list[_CameraSource] = []
+    zed_objects: dict[str, Any] = {}
+    for cam_cfg in config.get("cameras", []):
+        if not cam_cfg.get("enabled", True):
+            continue
+        backend = str(cam_cfg.get("backend", "realsense"))
+        cam_id = str(cam_cfg.get("id", ""))
+        if backend == "realsense":
+            obs_key = cam_cfg.get("obs_key")
+            if not obs_key:
+                continue
+            hw = _feature_image_shape(policy, obs_key, fallback_hw) if policy is not None else fallback_hw
+            camera = RealSenseColorCamera(
+                str(cam_cfg.get("serial", "")),
+                int(cam_cfg.get("color_width", 1280)),
+                int(cam_cfg.get("color_height", 720)),
+                int(cam_cfg.get("fps", 30)),
+            )
+            sources.append(_CameraSource(obs_key=obs_key, camera=camera, zed_view=None, target_hw=hw))
+        elif backend == "zed":
+            if cam_id not in zed_objects:
+                import types as _types
+                zed_cam = ZedStereoCamera(
+                    int(cam_cfg.get("serial", 0)),
+                    str(cam_cfg.get("resolution", "HD720")),
+                    int(cam_cfg.get("fps", 30)),
+                )
+                zed_cam.configure_exposure(_types.SimpleNamespace(
+                    exposure=cam_cfg.get("exposure", 60),
+                    auto_exposure=bool(cam_cfg.get("auto_exposure", False)),
+                ))
+                zed_objects[cam_id] = zed_cam
+            zed_cam = zed_objects[cam_id]
+            for attr, view in (("obs_key_left", "left"), ("obs_key_right", "right")):
+                obs_key = cam_cfg.get(attr)
+                if obs_key:
+                    hw = _feature_image_shape(policy, obs_key, fallback_hw) if policy is not None else fallback_hw
+                    sources.append(_CameraSource(obs_key=obs_key, camera=zed_cam, zed_view=view, target_hw=hw))
+    return sources
+
+
+def _read_images(sources: list[_CameraSource]) -> dict[str, np.ndarray]:
+    """Read one frame from each camera source, batching ZED grabs per camera object."""
+    images: dict[str, np.ndarray] = {}
+    zed_groups: dict[int, list[_CameraSource]] = {}
+    for source in sources:
+        if source.zed_view is not None:
+            zed_groups.setdefault(id(source.camera), []).append(source)
+        else:
+            images[source.obs_key] = source.camera.read_rgb(source.target_hw)
+    for zed_sources in zed_groups.values():
+        results = zed_sources[0].camera.read_views_rgb(
+            *((s.zed_view, s.target_hw) for s in zed_sources)
+        )
+        for source, image in zip(zed_sources, results):
+            images[source.obs_key] = image
+    return images
 
 
 def _ensure_supported_python() -> None:
@@ -750,6 +842,16 @@ def parse_args() -> argparse.Namespace:
         help="List available RealSense and ZED devices with serials, then exit.",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "YAML config in data_collection.yaml format. Enabled cameras with obs_key "
+            "(or obs_key_left / obs_key_right for ZED) drive camera setup and policy "
+            "observation key mapping. Robot bind_ip / port override --obs-bind-ip / --obs-port."
+        ),
+    )
+    parser.add_argument(
         "--policy-type",
         choices=sorted(POLICY_REGISTRY),
         default="smolvla",
@@ -775,36 +877,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge-ip", default="127.0.0.1")
     parser.add_argument("--action-port", type=int, default=28082)
     parser.add_argument("--rate-hz", type=float, default=30.0)
-    parser.add_argument(
-        "--top-camera-backend",
-        choices=["zed-left"],
-        default="zed-left",
-        help=(
-            "SDK-backed source for observation.images.top. Future models assume "
-            "this is the left-eye view from the wrist ZED stereo pair."
-        ),
-    )
-    parser.add_argument(
-        "--third-person-camera-backend",
-        choices=["realsense", "zed-left"],
-        default="realsense",
-        help=(
-            "SDK-backed source for observation.images.third_person_d405. "
-            "Newer checkpoints are expected to use the actual third-person D405 path here."
-        ),
-    )
-    parser.add_argument("--zed-serial", type=int, default=0, help="ZED serial number; 0 uses the first camera.")
-    parser.add_argument(
-        "--zed-resolution",
-        default="HD720",
-        choices=["VGA", "HD720", "HD1080", "HD2K"],
-        help="ZED camera resolution requested from the SDK.",
-    )
-    parser.add_argument("--zed-fps", type=int, default=30, help="ZED camera FPS requested from the SDK.")
-    parser.add_argument("--realsense-serial", default="", help="RealSense serial number; empty uses the first camera.")
-    parser.add_argument("--realsense-color-width", type=int, default=1280)
-    parser.add_argument("--realsense-color-height", type=int, default=720)
-    parser.add_argument("--realsense-fps", type=int, default=30)
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=720)
     parser.add_argument(
@@ -840,8 +912,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Hold the current measured joint configuration without loading any policy; useful for bridge smoke tests.",
     )
-    parser.add_argument("--exposure", type=int, default=60, help="ZED camera exposure to set manually.")
-    parser.add_argument("--auto-exposure", action="store_true", help="Enable ZED auto exposure.")
     return parser.parse_args()
 
 
@@ -852,14 +922,21 @@ def main() -> int:
         return _list_available_cameras()
     if args.rate_hz <= 0:
         raise ValueError("--rate-hz must be > 0")
-    if args.zed_fps <= 0:
-        raise ValueError("--zed-fps must be > 0")
-    if args.realsense_fps <= 0:
-        raise ValueError("--realsense-fps must be > 0")
     if not args.zero_actions and args.policy_path is None:
         raise ValueError("--policy-path is required unless --zero-actions is set")
+    if not args.zero_actions and args.config is None:
+        raise ValueError("--config is required unless --zero-actions is set")
     if args.camera_preview_samples <= 0:
         raise ValueError("--camera-preview-samples must be > 0")
+
+    deployment_config: dict[str, Any] = {}
+    if args.config is not None:
+        deployment_config = _load_yaml_config(args.config)
+        robot_cfg = deployment_config.get("robot", {}) or {}
+        if "bind_ip" in robot_cfg:
+            args.obs_bind_ip = str(robot_cfg["bind_ip"])
+        if "port" in robot_cfg:
+            args.obs_port = int(robot_cfg["port"])
 
     obs_rx = LatestRobotObservation(args.obs_bind_ip, args.obs_port)
     obs_rx.start()
@@ -872,8 +949,7 @@ def main() -> int:
     preprocess = None
     postprocess = None
     policy_state_dim = None
-    zed_camera = None
-    third_person_camera = None
+    camera_sources: list[_CameraSource] = []
     action_log: TextIO | None = None
 
     try:
@@ -913,7 +989,7 @@ def main() -> int:
             policy = policy_class.from_pretrained(policy_path)
             policy.to(device)
             policy.eval()
-            image_keys = (TOP_IMAGE_KEY, RIGHT_ZED_IMAGE_KEY, THIRD_PERSON_IMAGE_KEY)
+            image_keys = _obs_keys_from_config(deployment_config)
             policy_features = _validate_policy_features(policy, image_keys, args.print_policy_features)
             state_shape = _feature_shape(policy.config.input_features.get(OBS_STATE_KEY))
             if state_shape is None or len(state_shape) != 1:
@@ -924,78 +1000,28 @@ def main() -> int:
                 policy_path,
                 preprocessor_overrides={"device_processor": {"device": str(device)}},
             )
-            top_hw = _feature_image_shape(policy, TOP_IMAGE_KEY, (args.camera_height, args.camera_width))
-            right_hw = _feature_image_shape(policy, RIGHT_ZED_IMAGE_KEY, (args.camera_height, args.camera_width))
-            third_hw = _feature_image_shape(policy, THIRD_PERSON_IMAGE_KEY, (args.camera_height, args.camera_width))
-            zed_camera = ZedStereoCamera(args.zed_serial, args.zed_resolution, args.zed_fps)
-            zed_camera.configure_exposure(args)
-            if args.third_person_camera_backend == "realsense":
-                third_person_camera = RealSenseColorCamera(
-                    args.realsense_serial,
-                    args.realsense_color_width,
-                    args.realsense_color_height,
-                    args.realsense_fps,
-                )
+            fallback_hw = (args.camera_height, args.camera_width)
+            camera_sources = _build_camera_sources(deployment_config, policy, fallback_hw)
             preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
-            stereo_preview_start = time.monotonic()
-            top_preview_image = None
-            right_preview_image = None
-            third_preview_image = None
+            preview_start = time.monotonic()
+            preview_images: dict[str, np.ndarray] = {}
             for _ in range(args.camera_preview_samples):
-                if args.third_person_camera_backend == "zed-left":
-                    top_preview_image, right_preview_image, third_preview_image = zed_camera.read_views_rgb(
-                        ("left", top_hw),
-                        ("right", right_hw),
-                        ("left", third_hw),
-                    )
-                else:
-                    top_preview_image, right_preview_image = zed_camera.read_views_rgb(
-                        ("left", top_hw),
-                        ("right", right_hw),
-                    )
-            stereo_preview_elapsed_s = time.monotonic() - stereo_preview_start
-            assert top_preview_image is not None
-            assert right_preview_image is not None
-            top_preview = _preview_summary_from_image(
-                zed_camera.properties("left"),
-                TOP_IMAGE_KEY,
-                top_hw,
-                args.camera_preview_samples,
-                stereo_preview_elapsed_s,
-                top_preview_image,
-                preview_dir,
-            )
-            right_preview = _preview_summary_from_image(
-                zed_camera.properties("right"),
-                RIGHT_ZED_IMAGE_KEY,
-                right_hw,
-                args.camera_preview_samples,
-                stereo_preview_elapsed_s,
-                right_preview_image,
-                preview_dir,
-            )
-            if args.third_person_camera_backend == "realsense":
-                third_preview = _capture_startup_preview(
-                    third_person_camera,
-                    THIRD_PERSON_IMAGE_KEY,
-                    third_hw,
+                preview_images = _read_images(camera_sources)
+            preview_elapsed_s = time.monotonic() - preview_start
+            camera_previews = []
+            for source in camera_sources:
+                props = source.camera.properties(source.zed_view) if source.zed_view is not None else source.camera.properties()
+                summary = _preview_summary_from_image(
+                    props,
+                    source.obs_key,
+                    source.target_hw,
                     args.camera_preview_samples,
+                    preview_elapsed_s,
+                    preview_images[source.obs_key],
                     preview_dir,
                 )
-            else:
-                assert third_preview_image is not None
-                third_preview = _preview_summary_from_image(
-                    zed_camera.properties("left"),
-                    THIRD_PERSON_IMAGE_KEY,
-                    third_hw,
-                    args.camera_preview_samples,
-                    stereo_preview_elapsed_s,
-                    third_preview_image,
-                    preview_dir,
-                )
-            _print_camera_summary(top_preview)
-            _print_camera_summary(right_preview)
-            _print_camera_summary(third_preview)
+                _print_camera_summary(summary)
+                camera_previews.append(summary)
             if preview_dir is not None:
                 manifest_path = preview_dir / "manifest.json"
                 manifest_path.write_text(
@@ -1005,7 +1031,7 @@ def main() -> int:
                             "policy_path": policy_path,
                             "task": args.task,
                             "policy_features": policy_features,
-                            "cameras": [top_preview, right_preview, third_preview],
+                            "cameras": camera_previews,
                         },
                         indent=2,
                         sort_keys=True,
@@ -1021,9 +1047,6 @@ def main() -> int:
         else:
             torch = None
             prepare_observation_for_inference = None
-            top_hw = (args.camera_height, args.camera_width)
-            right_hw = (args.camera_height, args.camera_width)
-            third_hw = (args.camera_height, args.camera_width)
 
         print(
             f"Streaming policy joint targets to udp://{args.bridge_ip}:{args.action_port} "
@@ -1090,24 +1113,9 @@ def main() -> int:
                 assert torch is not None
                 assert prepare_observation_for_inference is not None
 
-                if args.third_person_camera_backend == "zed-left":
-                    top_image, right_image, third_person_image = zed_camera.read_views_rgb(
-                        ("left", top_hw),
-                        ("right", right_hw),
-                        ("left", third_hw),
-                    )
-                else:
-                    top_image, right_image = zed_camera.read_views_rgb(
-                        ("left", top_hw),
-                        ("right", right_hw),
-                    )
-                    assert third_person_camera is not None
-                    third_person_image = third_person_camera.read_rgb(third_hw)
                 raw_observation = {
                     OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
-                    TOP_IMAGE_KEY: top_image,
-                    RIGHT_ZED_IMAGE_KEY: right_image,
-                    THIRD_PERSON_IMAGE_KEY: third_person_image,
+                    **_read_images(camera_sources),
                 }
                 frame = prepare_observation_for_inference(
                     raw_observation,
@@ -1162,10 +1170,11 @@ def main() -> int:
         action_sock.close()
         if action_log is not None:
             action_log.close()
-        if zed_camera is not None:
-            zed_camera.close()
-        if third_person_camera is not None:
-            third_person_camera.close()
+        seen_camera_ids: set[int] = set()
+        for source in camera_sources:
+            if id(source.camera) not in seen_camera_ids:
+                seen_camera_ids.add(id(source.camera))
+                source.camera.close()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ cameras:
     enabled: true
     backend: realsense
     role: third_person
+    obs_key: observation.images.top
     camera_name: third_person_d405
     serial: "128422271175"
     color_width: 1280
@@ -33,6 +34,7 @@ cameras:
     enabled: true
     backend: realsense
     role: wrist
+    obs_key: observation.images.wrist_d405
     camera_name: wrist_d405
     serial: "128422271845"
     color_width: 1280
@@ -52,6 +54,8 @@ cameras:
     enabled: false
     backend: zed
     role: wrist
+    obs_key_left: observation.images.top
+    obs_key_right: observation.images.ee_zed_m_right
     camera_name: ee_zed_m
     left_camera_name: ee_zed_m_left
     right_camera_name: ee_zed_m_right
