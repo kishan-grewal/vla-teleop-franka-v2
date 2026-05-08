@@ -728,6 +728,21 @@ def _jsonable_action(action: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
 
 
+def _model_output_log_fields(raw_action: np.ndarray) -> dict[str, Any]:
+    action = np.asarray(raw_action, dtype=np.float64).reshape(-1)
+    if action.shape[0] != POLICY_ACTION_DIM:
+        return {
+            "model_output_unexpected_action_dim": int(action.shape[0]),
+            "model_output_expected_action_dim": POLICY_ACTION_DIM,
+        }
+    raw_joints = action[:JOINT_ACTION_DIM]
+    raw_gripper = float(action[JOINT_ACTION_DIM])
+    return {
+        "model_raw_joint_positions_rad": [float(v) for v in raw_joints],
+        "model_raw_gripper": raw_gripper,
+    }
+
+
 def _current_joint_positions(obs: dict[str, Any]) -> np.ndarray:
     q = obs.get("robot_state", {}).get("q", [])
     if not isinstance(q, list) or len(q) != JOINT_ACTION_DIM:
@@ -1156,6 +1171,19 @@ def main() -> int:
     def get_ema_alpha() -> float:
         return tuner.get("ema_alpha") if tuner is not None else args.ema_alpha
 
+    def log_event_marker(event_type: str, sequence_id: int, **fields: Any) -> None:
+        latest_obs = obs_rx.latest()
+        row = {
+            "timestamp_ns": time.monotonic_ns(),
+            "record_type": "event",
+            "event_type": event_type,
+            "sequence_id": sequence_id,
+            "policy_type": None if args.zero_actions else args.policy_type,
+            "robot_observation_timestamp_ns": None if latest_obs is None else latest_obs.get("timestamp_ns"),
+            **fields,
+        }
+        _write_jsonl(action_log, row)
+
     policy = None
     preprocess = None
     postprocess = None
@@ -1164,6 +1192,7 @@ def main() -> int:
     action_log: TextIO | None = None
     action_queue: Any = None  # RTC ActionQueue when --use-rtc
     rtc_inference_delay: int = 0
+    preview_dir: Path | None = None
 
     try:
         if args.log_actions_jsonl is not None:
@@ -1250,6 +1279,10 @@ def main() -> int:
             fallback_hw = (args.camera_height, args.camera_width)
             camera_sources = _build_camera_sources(deployment_config, policy, fallback_hw)
             preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
+            if action_log is None and preview_dir is not None:
+                default_log_path = preview_dir / "policy_actions.jsonl"
+                default_log_path.parent.mkdir(parents=True, exist_ok=True)
+                action_log = default_log_path.open("a", buffering=1)
             preview_start = time.monotonic()
             preview_images: dict[str, np.ndarray] = {}
             for _ in range(args.camera_preview_samples):
@@ -1369,9 +1402,19 @@ def main() -> int:
                     if action_queue is not None:
                         action_queue.clear()
                         rtc_needs_inference = True
+                    if policy is not None:
+                        policy.reset()
                     operator_rehome_pause = True
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
+                    log_event_marker(
+                        "operator_rehome_requested",
+                        sequence_id,
+                        operator_request_id=operator_request_id,
+                        operator_paused=True,
+                        operator_rehome_pause=True,
+                        policy_reset=policy is not None,
+                    )
                     print(
                         f"Re-home requested by operator (request_id={operator_request_id}). "
                         "Policy will stay paused until you press 'r'.",
@@ -1381,8 +1424,22 @@ def main() -> int:
                     operator_paused = False
                     rtc_needs_inference = True
                     operator_rehome_pause = False
+                    log_event_marker(
+                        "operator_resume_requested",
+                        sequence_id,
+                        operator_request_id=operator_request_id,
+                        operator_paused=False,
+                        operator_rehome_pause=False,
+                    )
                     print("Policy resume requested by operator.", flush=True)
                 elif normalized == "q":
+                    log_event_marker(
+                        "operator_shutdown_requested",
+                        sequence_id,
+                        operator_request_id=operator_request_id,
+                        operator_paused=operator_paused,
+                        operator_rehome_pause=operator_rehome_pause,
+                    )
                     print("Operator requested shutdown.", flush=True)
                     return 0
 
@@ -1474,6 +1531,7 @@ def main() -> int:
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
 
             action, gripper_command, clamp_info = _clamp_action_with_info(raw_action)
+            model_output_log = _model_output_log_fields(raw_action)
             alpha = get_ema_alpha()
             ema_applied = ema_prev_joints is not None and not operator_paused and alpha < 1.0
             if ema_applied:
@@ -1499,6 +1557,7 @@ def main() -> int:
                 "ema_applied": ema_applied,
                 "rtc_enabled": args.use_rtc,
                 "rtc_inference_delay": rtc_inference_delay if args.use_rtc else None,
+                **model_output_log,
                 **clamp_info,
             })
             _send_action(
