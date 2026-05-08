@@ -1508,6 +1508,8 @@ def main() -> int:
                     )
 
                     prev_actions = action_queue.get_left_over()
+                    if prev_actions is not None and prev_actions.numel() == 0:
+                        prev_actions = None
 
                     with torch.inference_mode():
                         action_chunk = policy.predict_action_chunk(
@@ -1516,6 +1518,18 @@ def main() -> int:
                             prev_chunk_left_over=prev_actions,
                         )
                         action_chunk = postprocess(action_chunk)
+                    if action_chunk.ndim == 3:
+                        if action_chunk.shape[0] != 1:
+                            raise ValueError(
+                                "RTC expects a single-batch action chunk; "
+                                f"got shape {tuple(action_chunk.shape)}"
+                            )
+                        action_chunk = action_chunk.squeeze(0)
+                    elif action_chunk.ndim != 2:
+                        raise ValueError(
+                            "RTC expects action chunks shaped (T, A) or (1, T, A); "
+                            f"got shape {tuple(action_chunk.shape)}"
+                        )
 
                     action_queue.merge(action_chunk, action_chunk, rtc_inference_delay)
                     rtc_needs_inference = False
