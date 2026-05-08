@@ -1199,7 +1199,7 @@ def main() -> int:
             # Configure RTC on the policy config before loading if requested.
             policy_cfg = None
             if args.use_rtc:
-                from lerobot.configs.types import RTCAttentionSchedule
+                from lerobot.configs import RTCAttentionSchedule
                 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
                 schedule_map = {
@@ -1427,7 +1427,7 @@ def main() -> int:
                 assert prepare_observation_for_inference is not None
 
                 # Check if we need to run inference (queue running low or first call).
-                queue_empty = action_queue.is_empty() if hasattr(action_queue, "is_empty") else (len(action_queue) == 0)
+                queue_empty = action_queue.empty()
                 if rtc_needs_inference or queue_empty:
                     raw_observation = {
                         OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
@@ -1458,8 +1458,7 @@ def main() -> int:
                 if raw_action is not None:
                     raw_action = raw_action.squeeze(0).detach().cpu().numpy()
                     # Schedule next inference when queue is getting low.
-                    queue_remaining = len(action_queue) if hasattr(action_queue, "__len__") else 0
-                    if queue_remaining <= rtc_inference_delay:
+                    if action_queue.qsize() <= rtc_inference_delay:
                         rtc_needs_inference = True
                 else:
                     # Queue unexpectedly empty; hold current position and re-trigger inference.
