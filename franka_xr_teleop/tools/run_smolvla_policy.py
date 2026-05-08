@@ -958,7 +958,7 @@ def _validate_rtc_flags(args: argparse.Namespace) -> None:
     if args.use_rtc:
         return
     rtc_flags: dict[str, Any] = {
-        "--rtc-execution-horizon": (args.rtc_execution_horizon, 10),
+        "--rtc-execution-horizon": (args.rtc_execution_horizon, 0),
         "--rtc-max-guidance-weight": (args.rtc_max_guidance_weight, 10.0),
         "--rtc-attention-schedule": (args.rtc_attention_schedule, "EXP"),
         "--rtc-inference-delay": (args.rtc_inference_delay, 0),
@@ -1082,11 +1082,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rtc-execution-horizon",
         type=int,
-        default=10,
+        default=0,
         help=(
-            "RTC: number of overlapping timesteps between chunks to enforce consistency on. "
-            "Higher values mean smoother transitions but potentially less reactivity. "
-            "Only used when --use-rtc is set. (default: 10)"
+            "RTC: how many steps to execute before re-observing and re-inferring. "
+            "0 (default) auto-sets to the measured inference_delay for maximum "
+            "reactivity — fresh observations as often as physically possible. "
+            "Higher values reduce inference frequency (smoother but less reactive). "
+            "Only used when --use-rtc is set. (default: 0 = auto)"
         ),
     )
     parser.add_argument(
@@ -1232,7 +1234,7 @@ def main() -> int:
             # Configure RTC on the policy config before loading if requested.
             policy_cfg = None
             if args.use_rtc:
-                from lerobot.configs.types import RTCAttentionSchedule
+                from lerobot.configs import RTCAttentionSchedule
                 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
                 schedule_map = {
@@ -1242,9 +1244,13 @@ def main() -> int:
                     "ZEROS": RTCAttentionSchedule.ZEROS,
                 }
 
+                # Use a temporary execution_horizon; will be updated after
+                # measuring inference delay if the user didn't set it explicitly.
+                initial_execution_horizon = args.rtc_execution_horizon if args.rtc_execution_horizon > 0 else 10
+
                 rtc_config = RTCConfig(
                     enabled=True,
-                    execution_horizon=args.rtc_execution_horizon,
+                    execution_horizon=initial_execution_horizon,
                     max_guidance_weight=args.rtc_max_guidance_weight,
                     prefix_attention_schedule=schedule_map[args.rtc_attention_schedule],
                 )
@@ -1253,13 +1259,6 @@ def main() -> int:
                 policy_cfg = policy_class.config_class()
                 policy_cfg.rtc_config = rtc_config
                 policy = policy_class.from_pretrained(policy_path, policy_cfg=policy_cfg)
-
-                print(
-                    f"RTC enabled: execution_horizon={args.rtc_execution_horizon} "
-                    f"max_guidance_weight={args.rtc_max_guidance_weight} "
-                    f"attention_schedule={args.rtc_attention_schedule}",
-                    flush=True,
-                )
             else:
                 policy = policy_class.from_pretrained(policy_path)
 
@@ -1330,8 +1329,6 @@ def main() -> int:
             if args.use_rtc:
                 from lerobot.policies.rtc.action_queue import ActionQueue
 
-                action_queue = ActionQueue(policy.config.rtc_config)
-
                 # Wait for a robot observation before measuring inference delay.
                 print("RTC: waiting for robot observation to measure inference delay...", flush=True)
                 while obs_rx.latest() is None:
@@ -1354,6 +1351,38 @@ def main() -> int:
                         robot_type=args.robot_type,
                         rate_hz=args.rate_hz,
                     )
+
+                # Auto-derive execution_horizon from measured inference_delay
+                # for maximum reactivity (re-observe as often as possible).
+                if args.rtc_execution_horizon <= 0:
+                    final_execution_horizon = rtc_inference_delay
+                    print(
+                        f"RTC: auto-set execution_horizon={final_execution_horizon} "
+                        f"(= inference_delay) for maximum reactivity",
+                        flush=True,
+                    )
+                else:
+                    final_execution_horizon = args.rtc_execution_horizon
+                    if final_execution_horizon < rtc_inference_delay:
+                        print(
+                            f"WARNING: --rtc-execution-horizon {final_execution_horizon} is less than "
+                            f"measured inference_delay {rtc_inference_delay}. The action queue may "
+                            f"drain before new chunks arrive, causing gaps.",
+                            flush=True,
+                        )
+
+                # Update the RTCConfig with the final execution_horizon and
+                # recreate the ActionQueue with the correct config.
+                policy.config.rtc_config.execution_horizon = final_execution_horizon
+                action_queue = ActionQueue(policy.config.rtc_config)
+
+                print(
+                    f"RTC ready: execution_horizon={final_execution_horizon} "
+                    f"inference_delay={rtc_inference_delay} "
+                    f"max_guidance_weight={args.rtc_max_guidance_weight} "
+                    f"attention_schedule={args.rtc_attention_schedule}",
+                    flush=True,
+                )
         else:
             torch = None
             prepare_observation_for_inference = None
@@ -1465,7 +1494,7 @@ def main() -> int:
                 assert prepare_observation_for_inference is not None
 
                 # Check if we need to run inference (queue running low or first call).
-                queue_empty = action_queue.is_empty() if hasattr(action_queue, "is_empty") else (len(action_queue) == 0)
+                queue_empty = action_queue.empty()
                 if rtc_needs_inference or queue_empty:
                     raw_observation = {
                         OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
@@ -1496,8 +1525,7 @@ def main() -> int:
                 if raw_action is not None:
                     raw_action = raw_action.squeeze(0).detach().cpu().numpy()
                     # Schedule next inference when queue is getting low.
-                    queue_remaining = len(action_queue) if hasattr(action_queue, "__len__") else 0
-                    if queue_remaining <= rtc_inference_delay:
+                    if action_queue.qsize() <= rtc_inference_delay:
                         rtc_needs_inference = True
                 else:
                     # Queue unexpectedly empty; hold current position and re-trigger inference.
