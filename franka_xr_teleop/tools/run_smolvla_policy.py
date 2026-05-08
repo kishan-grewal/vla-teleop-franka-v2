@@ -1454,12 +1454,12 @@ def main() -> int:
 
                     prev_actions = action_queue.get_left_over()
 
-                    with torch.inference_mode():
-                        action_chunk = policy.predict_action_chunk(
-                            preprocess(frame),
-                            inference_delay=rtc_inference_delay,
-                            prev_chunk_left_over=prev_actions,
-                        )
+                    action_chunk = policy.predict_action_chunk(
+                        preprocess(frame),
+                        inference_delay=rtc_inference_delay,
+                        prev_chunk_left_over=prev_actions,
+                    )
+                    with torch.no_grad():
                         processed_action_chunk = postprocess(action_chunk.clone())
 
                     original_actions = _action_sequence_from_chunk(action_chunk, "RTC action chunk").clone()

@@ -104,7 +104,16 @@ def test_sync_path(policy, preprocess, postprocess, device: torch.device, num_st
     return True
 
 
-def test_rtc_path(policy, preprocess, postprocess, device: torch.device, num_steps: int = 10):
+def test_rtc_path(
+    policy,
+    preprocess,
+    postprocess,
+    device: torch.device,
+    num_steps: int = 10,
+    rate_hz: float = 30.0,
+    rtc_inference_delay: int = 0,
+    require_nonempty_leftover: bool = False,
+):
     """Test the RTC predict_action_chunk + ActionQueue path."""
     print("\n=== Testing RTC path (predict_action_chunk + ActionQueue) ===")
 
@@ -127,27 +136,30 @@ def test_rtc_path(policy, preprocess, postprocess, device: torch.device, num_ste
     print(f"  Model RTC processor: {policy.model.rtc_processor is not None}")
     print(f"  _rtc_enabled(): {policy._rtc_enabled()}")
 
-    # Measure fake inference delay
-    print("  Measuring inference delay...")
-    obs = make_dummy_observation(policy, device)
-    frame = prepare_observation_for_inference(
-        obs, device, task="test task", robot_type="franka",
-    )
+    if rtc_inference_delay > 0:
+        inference_delay = rtc_inference_delay
+        print(f"  Using forced inference_delay={inference_delay} steps")
+    else:
+        # Measure fake inference delay
+        print("  Measuring inference delay...")
+        obs = make_dummy_observation(policy, device)
+        frame = prepare_observation_for_inference(
+            obs, device, task="test task", robot_type="franka",
+        )
 
-    times = []
-    for i in range(3):
-        start = time.monotonic()
-        with torch.inference_mode():
-            _ = policy.predict_action_chunk(preprocess(frame))
-        elapsed = time.monotonic() - start
-        times.append(elapsed)
-        print(f"    warmup {i}: {elapsed*1000:.1f}ms")
+        times = []
+        for i in range(3):
+            start = time.monotonic()
+            with torch.inference_mode():
+                _ = policy.predict_action_chunk(preprocess(frame))
+            elapsed = time.monotonic() - start
+            times.append(elapsed)
+            print(f"    warmup {i}: {elapsed*1000:.1f}ms")
 
-    median_s = float(np.median(times))
-    rate_hz = 30.0
-    step_period_s = 1.0 / rate_hz
-    inference_delay = max(1, int(np.ceil(median_s / step_period_s)))
-    print(f"  Measured: median={median_s*1000:.1f}ms inference_delay={inference_delay} steps")
+        median_s = float(np.median(times))
+        step_period_s = 1.0 / rate_hz
+        inference_delay = max(1, int(np.ceil(median_s / step_period_s)))
+        print(f"  Measured: median={median_s*1000:.1f}ms inference_delay={inference_delay} steps")
 
     # Set execution_horizon = inference_delay (auto behavior)
     final_execution_horizon = inference_delay
@@ -165,6 +177,9 @@ def test_rtc_path(policy, preprocess, postprocess, device: torch.device, num_ste
 
     # Run the RTC loop
     rtc_needs_inference = True
+    inference_count = 0
+    nonempty_leftover_inferences = 0
+    empty_leftover_inferences = 0
     for step in range(num_steps):
         obs = make_dummy_observation(policy, device)
         queue_empty = action_queue.empty()
@@ -179,13 +194,18 @@ def test_rtc_path(policy, preprocess, postprocess, device: torch.device, num_ste
                 f"  step {step}: INFERENCE "
                 f"prev_actions={'None' if prev_actions is None else f'shape={tuple(prev_actions.shape)} device={prev_actions.device}'}"
             )
+            inference_count += 1
+            if prev_actions is not None and prev_actions.numel() > 0:
+                nonempty_leftover_inferences += 1
+            elif prev_actions is not None:
+                empty_leftover_inferences += 1
 
-            with torch.inference_mode():
-                action_chunk_raw_batched = policy.predict_action_chunk(
-                    preprocess(frame),
-                    inference_delay=inference_delay,
-                    prev_chunk_left_over=prev_actions,
-                )
+            action_chunk_raw_batched = policy.predict_action_chunk(
+                preprocess(frame),
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_actions,
+            )
+            with torch.no_grad():
                 action_chunk_processed_batched = postprocess(action_chunk_raw_batched.clone())
 
             action_chunk_raw = action_sequence_from_chunk(action_chunk_raw_batched, "raw RTC action chunk")
@@ -223,6 +243,18 @@ def test_rtc_path(policy, preprocess, postprocess, device: torch.device, num_ste
             print(f"  step {step}: POP returned None, triggering inference")
             rtc_needs_inference = True
 
+    print(
+        "    RTC inference summary: "
+        f"inferences={inference_count} "
+        f"nonempty_leftover_inferences={nonempty_leftover_inferences} "
+        f"empty_leftover_inferences={empty_leftover_inferences}"
+    )
+    if require_nonempty_leftover and nonempty_leftover_inferences == 0:
+        raise AssertionError(
+            "Expected at least one RTC inference with non-empty prev_chunk_left_over. "
+            "Try --rtc-inference-delay 1 with --rtc-steps 50."
+        )
+
     # Test clear
     action_queue.clear()
     assert action_queue.empty(), "Queue should be empty after clear"
@@ -244,6 +276,21 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--sync-steps", type=int, default=5)
     parser.add_argument("--rtc-steps", type=int, default=10)
+    parser.add_argument("--rtc-rate-hz", type=float, default=30.0)
+    parser.add_argument(
+        "--rtc-inference-delay",
+        type=int,
+        default=0,
+        help=(
+            "Override measured RTC inference delay in action steps. "
+            "Useful on CPU to force non-empty leftovers, e.g. --rtc-inference-delay 1 --rtc-steps 50."
+        ),
+    )
+    parser.add_argument(
+        "--require-nonempty-rtc-leftover",
+        action="store_true",
+        help="Fail unless at least one RTC inference receives non-empty prev_chunk_left_over.",
+    )
     parser.add_argument("--skip-sync", action="store_true")
     parser.add_argument("--skip-rtc", action="store_true")
     args = parser.parse_args()
@@ -300,7 +347,16 @@ def main():
 
     if not args.skip_rtc:
         try:
-            results["rtc"] = test_rtc_path(policy, preprocess, postprocess, device, args.rtc_steps)
+            results["rtc"] = test_rtc_path(
+                policy,
+                preprocess,
+                postprocess,
+                device,
+                num_steps=args.rtc_steps,
+                rate_hz=args.rtc_rate_hz,
+                rtc_inference_delay=args.rtc_inference_delay,
+                require_nonempty_leftover=args.require_nonempty_rtc_leftover,
+            )
         except Exception:
             print(f"\n  RTC path FAILED:")
             traceback.print_exc()
