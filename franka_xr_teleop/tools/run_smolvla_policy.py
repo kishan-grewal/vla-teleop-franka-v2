@@ -664,6 +664,18 @@ def _feature_image_shape(policy: Any, key: str, fallback_hw: tuple[int, int]) ->
     return fallback_hw
 
 
+def _action_sequence_from_chunk(action_chunk: Any, name: str) -> Any:
+    """Return a single action sequence shaped (time_steps, action_dim)."""
+    ndim = getattr(action_chunk, "ndim", None)
+    if ndim == 3:
+        if int(action_chunk.shape[0]) != 1:
+            raise ValueError(f"{name} has batch size {action_chunk.shape[0]}; only batch size 1 is supported")
+        return action_chunk.squeeze(0)
+    if ndim == 2:
+        return action_chunk
+    raise ValueError(f"{name} must have shape (1, T, A) or (T, A), got {tuple(action_chunk.shape)}")
+
+
 def _clamp_action_with_info(action: np.ndarray) -> tuple[np.ndarray, float, dict[str, Any]]:
     action = np.asarray(action, dtype=np.float64).reshape(-1).copy()
     if action.shape[0] != POLICY_ACTION_DIM:
@@ -1448,9 +1460,14 @@ def main() -> int:
                             inference_delay=rtc_inference_delay,
                             prev_chunk_left_over=prev_actions,
                         )
-                        action_chunk = postprocess(action_chunk)
+                        processed_action_chunk = postprocess(action_chunk.clone())
 
-                    action_queue.merge(action_chunk, action_chunk, rtc_inference_delay)
+                    original_actions = _action_sequence_from_chunk(action_chunk, "RTC action chunk").clone()
+                    processed_actions = _action_sequence_from_chunk(
+                        processed_action_chunk,
+                        "postprocessed RTC action chunk",
+                    )
+                    action_queue.merge(original_actions, processed_actions, rtc_inference_delay)
                     rtc_needs_inference = False
 
                 # Pop one action from the queue.
