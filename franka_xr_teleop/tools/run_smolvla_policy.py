@@ -738,10 +738,16 @@ def _current_joint_positions(obs: dict[str, Any]) -> np.ndarray:
     return joint_positions
 
 
-def _current_hold_action(obs: dict[str, Any]) -> np.ndarray:
+def _current_hold_action(
+    obs: dict[str, Any],
+    gripper_command_override: Optional[float] = None,
+) -> np.ndarray:
     joint_positions = _current_joint_positions(obs)
-    gripper_state = str(obs.get("robot_state", {}).get("gripper_state", "OPEN")).upper()
-    gripper_command = 1.0 if gripper_state in {"CLOSE", "HOLD"} else 0.0
+    if gripper_command_override is None:
+        gripper_state = str(obs.get("robot_state", {}).get("gripper_state", "OPEN")).upper()
+        gripper_command = 1.0 if gripper_state in {"CLOSE", "HOLD"} else 0.0
+    else:
+        gripper_command = float(np.clip(gripper_command_override, 0.0, 1.0))
     return np.concatenate([joint_positions, np.asarray([gripper_command], dtype=np.float64)])
 
 
@@ -1341,6 +1347,7 @@ def main() -> int:
 
         sequence_id = 0
         operator_paused = False
+        operator_rehome_pause = False
         operator_request_id = 0
         rehome_request_retries_remaining = 0
         rtc_needs_inference = True  # RTC: trigger first inference immediately
@@ -1350,6 +1357,7 @@ def main() -> int:
                 normalized = key.lower()
                 if normalized == "p":
                     operator_paused = True
+                    operator_rehome_pause = False
                     ema_prev_joints = None
                     if action_queue is not None:
                         action_queue.clear()
@@ -1361,6 +1369,7 @@ def main() -> int:
                     if action_queue is not None:
                         action_queue.clear()
                         rtc_needs_inference = True
+                    operator_rehome_pause = True
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
                     print(
@@ -1371,6 +1380,7 @@ def main() -> int:
                 elif normalized == "r":
                     operator_paused = False
                     rtc_needs_inference = True
+                    operator_rehome_pause = False
                     print("Policy resume requested by operator.", flush=True)
                 elif normalized == "q":
                     print("Operator requested shutdown.", flush=True)
@@ -1436,6 +1446,9 @@ def main() -> int:
                     # Queue unexpectedly empty; hold current position and re-trigger inference.
                     raw_action = _current_hold_action(obs)
                     rtc_needs_inference = True
+            elif operator_paused:
+                hold_gripper_command = 0.0 if operator_rehome_pause else None
+                raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
             else:
                 # ---- Sync path: select_action (existing behavior, unchanged) ----
                 assert policy is not None
@@ -1475,6 +1488,7 @@ def main() -> int:
                 "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
                 "enabled": enabled,
                 "operator_paused": operator_paused,
+                "operator_rehome_pause": operator_rehome_pause,
                 "operator_request_id": operator_request_id,
                 "request_rehome": request_rehome,
                 "action_space": "joint_position_absolute",

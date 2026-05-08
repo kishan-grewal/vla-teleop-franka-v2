@@ -1840,6 +1840,8 @@ int FrankaTeleopController::Run(std::atomic<bool>* stop_requested) {
             std::cerr << "Runtime re-home interrupted.\n";
             return 6;
           }
+          desired_gripper_state.store(GripperState::kOpen, std::memory_order_release);
+          desired_gripper_width_m.store(config_.gripper.max_width_m, std::memory_order_release);
           last_completed_policy_rehome_request_id = request_id;
           motion_inhibit_until_ns = MonotonicNowNs() + kPostRehomeMotionInhibitNs;
           const RobotSnapshot home_snapshot = ToSnapshot(robot.readOnce());
