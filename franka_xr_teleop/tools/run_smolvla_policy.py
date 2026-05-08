@@ -735,10 +735,16 @@ def _current_joint_positions(obs: dict[str, Any]) -> np.ndarray:
     return joint_positions
 
 
-def _current_hold_action(obs: dict[str, Any]) -> np.ndarray:
+def _current_hold_action(
+    obs: dict[str, Any],
+    gripper_command_override: Optional[float] = None,
+) -> np.ndarray:
     joint_positions = _current_joint_positions(obs)
-    gripper_state = str(obs.get("robot_state", {}).get("gripper_state", "OPEN")).upper()
-    gripper_command = 1.0 if gripper_state in {"CLOSE", "HOLD"} else 0.0
+    if gripper_command_override is None:
+        gripper_state = str(obs.get("robot_state", {}).get("gripper_state", "OPEN")).upper()
+        gripper_command = 1.0 if gripper_state in {"CLOSE", "HOLD"} else 0.0
+    else:
+        gripper_command = float(np.clip(gripper_command_override, 0.0, 1.0))
     return np.concatenate([joint_positions, np.asarray([gripper_command], dtype=np.float64)])
 
 
@@ -1142,6 +1148,7 @@ def main() -> int:
 
         sequence_id = 0
         operator_paused = False
+        operator_rehome_pause = False
         operator_request_id = 0
         rehome_request_retries_remaining = 0
         while True:
@@ -1150,11 +1157,13 @@ def main() -> int:
                 normalized = key.lower()
                 if normalized == "p":
                     operator_paused = True
+                    operator_rehome_pause = False
                     ema_prev_joints = None
                     print("Policy paused by operator.", flush=True)
                 elif normalized == "h":
                     operator_paused = True
                     ema_prev_joints = None
+                    operator_rehome_pause = True
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
                     print(
@@ -1164,6 +1173,7 @@ def main() -> int:
                     )
                 elif normalized == "r":
                     operator_paused = False
+                    operator_rehome_pause = False
                     print("Policy resume requested by operator.", flush=True)
                 elif normalized == "q":
                     print("Operator requested shutdown.", flush=True)
@@ -1177,14 +1187,16 @@ def main() -> int:
             sequence_id += 1
             request_rehome = rehome_request_retries_remaining > 0
             enabled = (not operator_paused) and not request_rehome
-            if args.zero_actions or operator_paused:
+            if args.zero_actions:
                 raw_action = _current_hold_action(obs)
+            elif operator_paused:
+                hold_gripper_command = 0.0 if operator_rehome_pause else None
+                raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
             else:
                 assert policy is not None
                 assert preprocess is not None
                 assert postprocess is not None
                 assert policy_state_dim is not None
-                assert zed_camera is not None
                 assert torch is not None
                 assert prepare_observation_for_inference is not None
 
@@ -1218,6 +1230,7 @@ def main() -> int:
                 "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
                 "enabled": enabled,
                 "operator_paused": operator_paused,
+                "operator_rehome_pause": operator_rehome_pause,
                 "operator_request_id": operator_request_id,
                 "request_rehome": request_rehome,
                 "action_space": "joint_position_absolute",
