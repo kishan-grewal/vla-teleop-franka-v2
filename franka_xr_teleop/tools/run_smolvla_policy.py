@@ -1197,7 +1197,6 @@ def main() -> int:
             policy_path = str(_resolve_policy_path(args.policy_path))
 
             # Configure RTC on the policy config before loading if requested.
-            policy_cfg = None
             if args.use_rtc:
                 from lerobot.configs import RTCAttentionSchedule
                 from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -1220,10 +1219,11 @@ def main() -> int:
                     prefix_attention_schedule=schedule_map[args.rtc_attention_schedule],
                 )
 
-                # Load with RTC config applied.
-                policy_cfg = policy_class.config_class()
-                policy_cfg.rtc_config = rtc_config
-                policy = policy_class.from_pretrained(policy_path, policy_cfg=policy_cfg)
+                # Load normally, then apply RTC config after loading since
+                # from_pretrained loads config from the checkpoint.
+                policy = policy_class.from_pretrained(policy_path)
+                policy.config.rtc_config = rtc_config
+                policy.init_rtc_processor()
             else:
                 policy = policy_class.from_pretrained(policy_path)
 
