@@ -7,11 +7,13 @@ import argparse
 import contextlib
 from dataclasses import dataclass
 import json
+import math
 import select
 import socket
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, TextIO
@@ -927,7 +929,7 @@ def _measure_inference_delay(
     warmup_iters: int = 3,
     measure_iters: int = 5,
 ) -> int:
-    """Measure actual inference latency and convert to action steps at the given rate."""
+    """Measure startup policy latency and convert to action steps at the given rate."""
     import torch
 
     raw_observation = {
@@ -965,6 +967,254 @@ def _measure_inference_delay(
     return inference_delay
 
 
+def _sequence_length(value: Any | None) -> int | None:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return int(shape[0]) if len(shape) > 0 else 0
+    with contextlib.suppress(TypeError):
+        return len(value)
+    return None
+
+
+class RTCActionProducer:
+    """Background chunk producer for RTC deployment.
+
+    The main loop stays responsible for sending one action packet per tick.
+    This producer observes, infers, postprocesses, and merges chunks into the
+    shared ActionQueue without blocking UDP action streaming.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy: Any,
+        preprocess: Any,
+        postprocess: Any,
+        prepare_observation_for_inference: Any,
+        camera_sources: list[_CameraSource],
+        obs_rx: LatestRobotObservation,
+        action_queue: Any,
+        policy_state_dim: int,
+        device: Any,
+        task: str,
+        robot_type: str,
+        period_s: float,
+        initial_inference_delay: int,
+        execution_horizon: int,
+        refill_threshold: int | None,
+    ) -> None:
+        self._policy = policy
+        self._preprocess = preprocess
+        self._postprocess = postprocess
+        self._prepare_observation_for_inference = prepare_observation_for_inference
+        self._camera_sources = camera_sources
+        self._obs_rx = obs_rx
+        self._action_queue = action_queue
+        self._policy_state_dim = policy_state_dim
+        self._device = device
+        self._task = task
+        self._robot_type = robot_type
+        self._period_s = period_s
+        self._execution_horizon = max(1, int(execution_horizon))
+        self._explicit_refill_threshold = refill_threshold
+        self._current_delay_steps = max(1, int(initial_inference_delay))
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._active = True
+        self._busy = False
+        self._generation = 0
+        self._requested_refill_reason: str | None = "initial"
+        self._thread = threading.Thread(target=self._run, name="RTCActionProducer", daemon=True)
+
+        self._inference_count = 0
+        self._skipped_merge_count = 0
+        self._underrun_count = 0
+        self._last_refill_reason: str | None = None
+        self._last_total_ms: float | None = None
+        self._last_model_ms: float | None = None
+        self._last_merge_delay_steps: int | None = None
+        self._last_prev_leftover_len: int | None = None
+        self._last_action_index_before_inference: int | None = None
+        self._last_error_traceback: str | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        self._thread.join()
+
+    def set_active(self, active: bool, *, clear_queue: bool, reason: str) -> None:
+        with self._lock:
+            self._active = active
+            self._generation += 1
+            if clear_queue:
+                self._action_queue.clear()
+            self._requested_refill_reason = reason if active else None
+        self._wake.set()
+
+    def request_inference(self, reason: str) -> None:
+        with self._lock:
+            if self._active:
+                self._requested_refill_reason = reason
+        self._wake.set()
+
+    def notify_queue_underrun(self) -> None:
+        with self._lock:
+            self._underrun_count += 1
+            if self._active:
+                self._requested_refill_reason = "queue_empty_after_pop"
+        self._wake.set()
+
+    def refill_threshold(self) -> int:
+        with self._lock:
+            return self._refill_threshold_locked()
+
+    def wait_until_idle(self, timeout_s: float | None = None) -> bool:
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                if not self._busy:
+                    return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+
+    def raise_if_failed(self) -> None:
+        with self._lock:
+            error_traceback = self._last_error_traceback
+        if error_traceback is not None:
+            raise RuntimeError(f"RTC action producer failed:\n{error_traceback}")
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            queue_size = self._action_queue.qsize()
+            original_leftover_len = _sequence_length(self._action_queue.get_left_over())
+            processed_leftover_len = _sequence_length(self._action_queue.get_processed_left_over())
+            return {
+                "rtc_producer_active": self._active,
+                "rtc_producer_busy": self._busy,
+                "rtc_queue_size": queue_size,
+                "rtc_original_leftover_len": original_leftover_len,
+                "rtc_processed_leftover_len": processed_leftover_len,
+                "rtc_refill_threshold": self._refill_threshold_locked(),
+                "rtc_execution_horizon": self._execution_horizon,
+                "rtc_current_inference_delay": self._current_delay_steps,
+                "rtc_last_merge_delay": self._last_merge_delay_steps,
+                "rtc_last_chunk_total_ms": self._last_total_ms,
+                "rtc_last_model_inference_ms": self._last_model_ms,
+                "rtc_last_refill_reason": self._last_refill_reason,
+                "rtc_last_prev_leftover_len": self._last_prev_leftover_len,
+                "rtc_last_action_index_before_inference": self._last_action_index_before_inference,
+                "rtc_inference_count": self._inference_count,
+                "rtc_skipped_merge_count": self._skipped_merge_count,
+                "rtc_queue_underrun_count": self._underrun_count,
+                "rtc_producer_error": self._last_error_traceback is not None,
+            }
+
+    def _refill_threshold_locked(self) -> int:
+        if self._explicit_refill_threshold is not None:
+            return self._explicit_refill_threshold
+        return self._current_delay_steps + self._execution_horizon
+
+    def _run(self) -> None:
+        poll_s = min(max(self._period_s * 0.5, 0.005), 0.05)
+        while not self._stop.is_set():
+            self._wake.wait(timeout=poll_s)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+
+            with self._lock:
+                if not self._active:
+                    continue
+
+                queue_size = self._action_queue.qsize()
+                refill_threshold = self._refill_threshold_locked()
+                forced_reason = self._requested_refill_reason
+                if forced_reason is not None:
+                    refill_reason = forced_reason
+                    self._requested_refill_reason = None
+                elif queue_size <= refill_threshold:
+                    refill_reason = "queue_low"
+                else:
+                    continue
+
+                obs = self._obs_rx.latest()
+                if obs is None:
+                    self._requested_refill_reason = refill_reason
+                    continue
+
+                generation = self._generation
+                planned_delay_steps = self._current_delay_steps
+                action_index_before_inference = self._action_queue.get_action_index()
+                prev_actions = self._action_queue.get_left_over()
+                prev_leftover_len = _sequence_length(prev_actions)
+                self._last_refill_reason = refill_reason
+                self._last_prev_leftover_len = prev_leftover_len
+                self._last_action_index_before_inference = action_index_before_inference
+                self._busy = True
+
+            try:
+                start = time.monotonic()
+                raw_observation = {
+                    OBS_STATE_KEY: _robot_state_vector(obs, self._policy_state_dim),
+                    **_read_images(self._camera_sources),
+                }
+                frame = self._prepare_observation_for_inference(
+                    raw_observation,
+                    self._device,
+                    task=self._task,
+                    robot_type=self._robot_type,
+                )
+                preprocessed_frame = self._preprocess(frame)
+                model_start = time.monotonic()
+                action_chunk = self._policy.predict_action_chunk(
+                    preprocessed_frame,
+                    inference_delay=planned_delay_steps,
+                    prev_chunk_left_over=prev_actions,
+                )
+                model_elapsed_s = time.monotonic() - model_start
+                processed_action_chunk = self._postprocess(action_chunk.clone())
+                original_actions = _action_sequence_from_chunk(action_chunk, "RTC action chunk").clone()
+                processed_actions = _action_sequence_from_chunk(
+                    processed_action_chunk,
+                    "postprocessed RTC action chunk",
+                )
+                total_elapsed_s = time.monotonic() - start
+                merge_delay_steps = max(1, int(math.ceil(total_elapsed_s / self._period_s)))
+
+                with self._lock:
+                    if self._active and generation == self._generation and not self._stop.is_set():
+                        self._action_queue.merge(
+                            original_actions,
+                            processed_actions,
+                            merge_delay_steps,
+                            action_index_before_inference,
+                        )
+                        self._current_delay_steps = merge_delay_steps
+                        self._last_total_ms = total_elapsed_s * 1000.0
+                        self._last_model_ms = model_elapsed_s * 1000.0
+                        self._last_merge_delay_steps = merge_delay_steps
+                        self._inference_count += 1
+                        self._requested_refill_reason = None
+                    else:
+                        self._skipped_merge_count += 1
+            except Exception:
+                with self._lock:
+                    self._last_error_traceback = traceback.format_exc()
+                self._stop.set()
+            finally:
+                with self._lock:
+                    self._busy = False
+
+
 def _validate_rtc_flags(args: argparse.Namespace) -> None:
     """Error if RTC-specific flags are set without --use-rtc."""
     if args.use_rtc:
@@ -974,6 +1224,7 @@ def _validate_rtc_flags(args: argparse.Namespace) -> None:
         "--rtc-max-guidance-weight": (args.rtc_max_guidance_weight, 10.0),
         "--rtc-attention-schedule": (args.rtc_attention_schedule, "EXP"),
         "--rtc-inference-delay": (args.rtc_inference_delay, 0),
+        "--rtc-refill-threshold": (args.rtc_refill_threshold, 0),
     }
     non_default = [flag for flag, (value, default) in rtc_flags.items() if value != default]
     if non_default:
@@ -1123,10 +1374,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "RTC: how many steps to execute before re-observing and re-inferring. "
+            "RTC: how many overlapping leftover steps to guide/blend against when inferring a new chunk. "
             "0 (default) auto-sets to the measured inference_delay for maximum "
-            "reactivity — fresh observations as often as physically possible. "
-            "Higher values reduce inference frequency (smoother but less reactive). "
+            "reactivity. Higher values are smoother but less reactive. "
             "Only used when --use-rtc is set. (default: 0 = auto)"
         ),
     )
@@ -1155,8 +1405,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "RTC: how many action steps the robot advances during one inference call. "
-            "0 means auto-measure at startup by timing a few inference passes. "
+            "RTC: initial estimate for how many action steps the robot advances during one inference call. "
+            "0 means auto-measure at startup; live RTC updates this from full chunk-production latency. "
+            "Only used when --use-rtc is set. (default: 0 = auto)"
+        ),
+    )
+    parser.add_argument(
+        "--rtc-refill-threshold",
+        type=int,
+        default=0,
+        help=(
+            "RTC: request a new chunk when the queued action count is at or below this threshold. "
+            "0 (default) auto-sets to current_inference_delay + execution_horizon so chunks overlap. "
             "Only used when --use-rtc is set. (default: 0 = auto)"
         ),
     )
@@ -1179,6 +1439,8 @@ def main() -> int:
         raise ValueError("--camera-preview-samples must be > 0")
     if not (0.0 < args.ema_alpha <= 1.0):
         raise ValueError("--ema-alpha must be in (0, 1]")
+    if args.rtc_refill_threshold < 0:
+        raise ValueError("--rtc-refill-threshold must be >= 0")
     _validate_rtc_flags(args)
     if args.use_rtc and args.policy_type not in RTC_COMPATIBLE_POLICY_TYPES:
         raise ValueError(
@@ -1233,7 +1495,9 @@ def main() -> int:
     action_log: TextIO | None = None
     preview_dir: Path | None = None
     action_queue: Any = None  # RTC ActionQueue when --use-rtc
+    rtc_action_producer: RTCActionProducer | None = None
     rtc_inference_delay: int = 0
+    rtc_refill_threshold: int | None = None
 
     gripper_hold_requirement = GripperHoldRequirement(command_count_threshold=7)
 
@@ -1417,10 +1681,31 @@ def main() -> int:
                 # recreate the ActionQueue with the correct config.
                 policy.config.rtc_config.execution_horizon = final_execution_horizon
                 action_queue = ActionQueue(policy.config.rtc_config)
+                rtc_refill_threshold = args.rtc_refill_threshold if args.rtc_refill_threshold > 0 else None
+
+                rtc_action_producer = RTCActionProducer(
+                    policy=policy,
+                    preprocess=preprocess,
+                    postprocess=postprocess,
+                    prepare_observation_for_inference=prepare_observation_for_inference,
+                    camera_sources=camera_sources,
+                    obs_rx=obs_rx,
+                    action_queue=action_queue,
+                    policy_state_dim=policy_state_dim,
+                    device=device,
+                    task=args.task,
+                    robot_type=args.robot_type,
+                    period_s=period_s,
+                    initial_inference_delay=rtc_inference_delay,
+                    execution_horizon=final_execution_horizon,
+                    refill_threshold=rtc_refill_threshold,
+                )
+                rtc_action_producer.start()
 
                 print(
                     f"RTC ready: execution_horizon={final_execution_horizon} "
-                    f"inference_delay={rtc_inference_delay} "
+                    f"initial_inference_delay={rtc_inference_delay} "
+                    f"refill_threshold={rtc_refill_threshold or 'auto'} "
                     f"max_guidance_weight={args.rtc_max_guidance_weight} "
                     f"attention_schedule={args.rtc_attention_schedule}",
                     flush=True,
@@ -1454,7 +1739,6 @@ def main() -> int:
         operator_rehome_pause = False
         operator_request_id = 0
         rehome_request_retries_remaining = 0
-        rtc_needs_inference = True  # RTC: trigger first inference immediately
         while True:
             start = time.monotonic()
             for key in keyboard.poll():
@@ -1463,18 +1747,26 @@ def main() -> int:
                     operator_paused = True
                     operator_rehome_pause = False
                     ema_prev_joints = None
-                    if action_queue is not None:
+                    if rtc_action_producer is not None:
+                        rtc_action_producer.set_active(False, clear_queue=True, reason="operator_pause")
+                    elif action_queue is not None:
                         action_queue.clear()
-                        rtc_needs_inference = True
                     print("Policy paused by operator.", flush=True)
                 elif normalized == "h":
                     operator_paused = True
                     ema_prev_joints = None
-                    if policy is not None:
-                        policy.reset()
-                    if action_queue is not None:
+                    producer_idle = True
+                    policy_reset_applied = False
+                    if rtc_action_producer is not None:
+                        rtc_action_producer.set_active(False, clear_queue=True, reason="operator_rehome")
+                        producer_idle = rtc_action_producer.wait_until_idle(timeout_s=2.0)
+                    elif action_queue is not None:
                         action_queue.clear()
-                        rtc_needs_inference = True
+                    if policy is not None and producer_idle:
+                        policy.reset()
+                        policy_reset_applied = True
+                    elif policy is not None:
+                        print("WARNING: RTC producer still busy; skipped policy.reset() for re-home.", flush=True)
                     operator_rehome_pause = True
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
@@ -1485,7 +1777,7 @@ def main() -> int:
                         operator_request_id=operator_request_id,
                         operator_paused=True,
                         operator_rehome_pause=True,
-                        policy_reset=policy is not None,
+                        policy_reset=policy_reset_applied,
                     )
                     print(
                         f"Re-home requested by operator (request_id={operator_request_id}). "
@@ -1502,7 +1794,8 @@ def main() -> int:
                         operator_paused=False,
                         operator_rehome_pause=False,
                     )
-                    rtc_needs_inference = True
+                    if rtc_action_producer is not None:
+                        rtc_action_producer.set_active(True, clear_queue=True, reason="operator_resume")
                     print("Policy resume requested by operator.", flush=True)
                 elif normalized == "q":
                     log_event_marker(
@@ -1530,58 +1823,20 @@ def main() -> int:
                 hold_gripper_command = 0.0 if operator_rehome_pause else None
                 raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
             elif args.use_rtc:
-                # ---- RTC path: chunk-based with ActionQueue ----
-                assert policy is not None
-                assert preprocess is not None
-                assert postprocess is not None
-                assert policy_state_dim is not None
+                # ---- RTC path: consume queued chunks while a background thread infers ----
                 assert action_queue is not None
-                assert torch is not None
-                assert prepare_observation_for_inference is not None
+                assert rtc_action_producer is not None
 
-                # Check if we need to run inference (queue running low or first call).
-                queue_empty = action_queue.empty()
-                if rtc_needs_inference or queue_empty:
-                    raw_observation = {
-                        OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
-                        **_read_images(camera_sources),
-                    }
-                    frame = prepare_observation_for_inference(
-                        raw_observation,
-                        torch.device(args.device),
-                        task=args.task,
-                        robot_type=args.robot_type,
-                    )
-
-                    prev_actions = action_queue.get_left_over()
-
-                    action_chunk = policy.predict_action_chunk(
-                        preprocess(frame),
-                        inference_delay=rtc_inference_delay,
-                        prev_chunk_left_over=prev_actions,
-                    )
-                    with torch.no_grad():
-                        processed_action_chunk = postprocess(action_chunk.clone())
-
-                    original_actions = _action_sequence_from_chunk(action_chunk, "RTC action chunk").clone()
-                    processed_actions = _action_sequence_from_chunk(
-                        processed_action_chunk,
-                        "postprocessed RTC action chunk",
-                    )
-                    action_queue.merge(original_actions, processed_actions, rtc_inference_delay)
-                    rtc_needs_inference = False
-
-                # Pop one action from the queue.
-                raw_action = action_queue.get()
-                if raw_action is not None:
-                    raw_action = raw_action.squeeze(0).detach().cpu().numpy()
-                    # Schedule next inference when queue is getting low.
-                    if action_queue.qsize() <= rtc_inference_delay:
-                        rtc_needs_inference = True
+                rtc_action_producer.raise_if_failed()
+                raw_action_tensor = action_queue.get()
+                if raw_action_tensor is not None:
+                    raw_action = raw_action_tensor.squeeze(0).detach().cpu().numpy()
+                    if action_queue.qsize() <= rtc_action_producer.refill_threshold():
+                        rtc_action_producer.request_inference("queue_low_after_pop")
                 else:
-                    # Queue unexpectedly empty; hold current position and re-trigger inference.
+                    # Queue is empty during startup or after an overrun; hold and wake the producer.
                     raw_action = _current_hold_action(obs)
-                    rtc_needs_inference = True
+                    rtc_action_producer.notify_queue_underrun()
             else:
                 # ---- Sync path: select_action (existing behavior, unchanged) ----
                 assert policy is not None
@@ -1614,6 +1869,11 @@ def main() -> int:
             if ema_applied:
                 action[:JOINT_ACTION_DIM] = alpha * action[:JOINT_ACTION_DIM] + (1.0 - alpha) * ema_prev_joints
             ema_prev_joints = action[:JOINT_ACTION_DIM].copy()
+            rtc_log_fields = (
+                rtc_action_producer.snapshot()
+                if args.use_rtc and rtc_action_producer is not None
+                else {}
+            )
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
@@ -1634,7 +1894,12 @@ def main() -> int:
                 "ema_alpha": alpha,
                 "ema_applied": ema_applied,
                 "rtc_enabled": args.use_rtc,
-                "rtc_inference_delay": rtc_inference_delay if args.use_rtc else None,
+                "rtc_inference_delay": (
+                    rtc_log_fields.get("rtc_current_inference_delay", rtc_inference_delay)
+                    if args.use_rtc
+                    else None
+                ),
+                **rtc_log_fields,
                 **clamp_info,
                 **model_output_log,
             })
@@ -1658,6 +1923,8 @@ def main() -> int:
         return 0
     finally:
         keyboard.stop()
+        if rtc_action_producer is not None:
+            rtc_action_producer.stop()
         if tuner is not None:
             tuner.stop()
         obs_rx.stop()
