@@ -1037,6 +1037,7 @@ class RTCActionProducer:
         self._last_total_ms: float | None = None
         self._last_model_ms: float | None = None
         self._last_merge_delay_steps: int | None = None
+        self._last_queue_advance_steps: int | None = None
         self._last_prev_leftover_len: int | None = None
         self._last_action_index_before_inference: int | None = None
         self._last_error_traceback: str | None = None
@@ -1107,6 +1108,7 @@ class RTCActionProducer:
                 "rtc_execution_horizon": self._execution_horizon,
                 "rtc_current_inference_delay": self._current_delay_steps,
                 "rtc_last_merge_delay": self._last_merge_delay_steps,
+                "rtc_last_queue_advance_steps": self._last_queue_advance_steps,
                 "rtc_last_chunk_total_ms": self._last_total_ms,
                 "rtc_last_model_inference_ms": self._last_model_ms,
                 "rtc_last_refill_reason": self._last_refill_reason,
@@ -1191,17 +1193,21 @@ class RTCActionProducer:
                 merge_delay_steps = max(1, int(math.ceil(total_elapsed_s / self._period_s)))
 
                 with self._lock:
+                    queue_advance_steps = max(
+                        0,
+                        self._action_queue.get_action_index() - action_index_before_inference,
+                    )
                     if self._active and generation == self._generation and not self._stop.is_set():
                         self._action_queue.merge(
                             original_actions,
                             processed_actions,
                             merge_delay_steps,
-                            action_index_before_inference,
                         )
                         self._current_delay_steps = merge_delay_steps
                         self._last_total_ms = total_elapsed_s * 1000.0
                         self._last_model_ms = model_elapsed_s * 1000.0
                         self._last_merge_delay_steps = merge_delay_steps
+                        self._last_queue_advance_steps = queue_advance_steps
                         self._inference_count += 1
                         self._requested_refill_reason = None
                     else:
