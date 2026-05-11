@@ -1,22 +1,24 @@
-1khz thread.
+"insert the orange MSD connector inside the orange socket"
+- Decent, generally grasped the back half of the plug
 
-PREVIOUSLY:
+"push the plug fully into the port"
+- Consistently much too low grab, was grasping the body of the plug
 
-1. Compute joint error: `target_delta = planned.target_q - state.q_d`
-2. Apply small deadzone
-3. Scale by RT gain: `filtered_delta = rt_alpha * target_delta`
-4. Clamp directly to the max per-cycle step: `command_delta = clamp(filtered_delta, -max_step, +max_step)`
-5. Send: `q_cmd = state.q_d + command_delta`
-Problem with that:
+"push the orange plug fully into the blue block port"
+- same as above
 
-NEW:
+"push the plug into the port"
+- couple of very good grasps, less good at final positioning?
+- then started going low + forward
 
-1. Compute joint error: `target_delta = planned.target_q - state.q_d`
-2. Apply small deadzone
-3. Apply RT gain: `filtered_delta = rt_alpha * target_delta`
-4. Convert that into a desired joint velocity: `desired_velocity = filtered_delta / dt`
-5. Limit that velocity by max joint velocity
-6. Limit how much velocity is allowed to change from the previous cycle using:
-`max_joint_acceleration_radps2 * dt`
-7. Convert the limited velocity back into a step: `unclamped_delta = accel_limited_velocity * dt`
-8. Apply the final hard step clamp. Send: `q_cmd = state.q_d + command_delta`
+Drive the orange connector inside the slot
+- low grasps, fairly centred
+
+push the orange MSD connector into the port
+- rear grasps, plug was generally forward of the socket though it did track backward, without full insertion
+
+push the orange MSD connector inside the slot
+- hesitant on grasp, high grasps
+
+push the orange MSD connector securely into the socket
+- SUCCESS

@@ -103,6 +103,7 @@ def load_log(path: Path):
     action_times_ns: list[int] = []
     joint_rows: list[list[float]] = []
     raw_gripper: list[float] = []
+    latched_gripper: list[float] = []
     event_times_ns: dict[str, list[int]] = {key: [] for key in EVENT_STYLES}
 
     for line_no, row in iter_jsonl(path):
@@ -125,6 +126,7 @@ def load_log(path: Path):
         action_times_ns.append(timestamp_ns)
         joint_rows.append(joints)
         raw_gripper.append(gripper)
+        latched_gripper.append(row.get("latched_gripper_command"))
 
     if not action_times_ns and not any(event_times_ns.values()):
         raise RuntimeError(f"No plottable action or event rows found in {path}")
@@ -135,11 +137,12 @@ def load_log(path: Path):
     action_t_s = (np.asarray(action_times_ns, dtype=np.float64) - float(t0_ns)) * 1e-9
     joint_array = np.asarray(joint_rows, dtype=np.float64) if joint_rows else np.empty((0, JOINT_ACTION_DIM))
     gripper_array = np.asarray(raw_gripper, dtype=np.float64) if raw_gripper else np.empty((0,), dtype=np.float64)
+    latched_gripper_array = np.asarray(latched_gripper, dtype=np.float64) if latched_gripper else np.empty((0,), dtype=np.float64)
     event_t_s = {
         event: (np.asarray(times, dtype=np.float64) - float(t0_ns)) * 1e-9
         for event, times in event_times_ns.items()
     }
-    return action_t_s, joint_array, gripper_array, event_t_s
+    return action_t_s, joint_array, gripper_array, latched_gripper_array, event_t_s
 
 
 def add_event_markers(ax, event_t_s: dict[str, np.ndarray]) -> None:
@@ -171,7 +174,7 @@ def add_legend(ax) -> None:
         ax.legend(loc="upper right", fontsize=8, ncol=2)
 
 
-def make_figure(action_t_s: np.ndarray, joint_array: np.ndarray, gripper_array: np.ndarray, event_t_s: dict[str, np.ndarray]):
+def make_figure(action_t_s: np.ndarray, joint_array: np.ndarray, gripper_array: np.ndarray, latched_gripper_array: np.ndarray, event_t_s: dict[str, np.ndarray]):
     fig, axes = plt.subplots(JOINT_ACTION_DIM + 1, 1, figsize=(16, 20), sharex=True)
 
     for joint in range(JOINT_ACTION_DIM):
@@ -185,6 +188,7 @@ def make_figure(action_t_s: np.ndarray, joint_array: np.ndarray, gripper_array: 
     gripper_ax = axes[-1]
     if gripper_array.size > 0:
         gripper_ax.plot(action_t_s, gripper_array, color="tab:purple", label="raw_gripper")
+        gripper_ax.plot(action_t_s, latched_gripper_array, color="tab:blue", label="latched_gripper")
         gripper_ax.axhline(0.5, color="black", linestyle=":", alpha=0.8, label="threshold=0.5")
     add_event_markers(gripper_ax, event_t_s)
     style_axis(gripper_ax, "Gripper")
@@ -203,8 +207,8 @@ def main() -> int:
     if output_path is None:
         output_path = args.jsonl.with_name(f"{args.jsonl.stem}_plot.png")
 
-    action_t_s, joint_array, gripper_array, event_t_s = load_log(args.jsonl)
-    fig = make_figure(action_t_s, joint_array, gripper_array, event_t_s)
+    action_t_s, joint_array, gripper_array, latched_gripper_array, event_t_s = load_log(args.jsonl)
+    fig = make_figure(action_t_s, joint_array, gripper_array, latched_gripper_array, event_t_s)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150)
     print(f"Saved plot: {output_path}", flush=True)

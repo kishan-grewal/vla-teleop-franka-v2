@@ -982,6 +982,33 @@ def _validate_rtc_flags(args: argparse.Namespace) -> None:
             "Either add --use-rtc or remove the RTC-specific flags."
         )
 
+class GripperHoldRequirement:
+    def __init__(self, command_count_threshold: int):
+        self.command_count_threshold = command_count_threshold
+        self.latched_command = 0
+
+        self.command_index = 0
+        self.latched_command_index = 0
+
+    def update(self, command: float) -> float:
+        self.command_index += 1
+        command = 1.0 if command > 0.5 else 0.0
+        if command == self.latched_command:
+            self.latched_command_index = self.command_index
+            return self.latched_command
+
+        if self.command_index - self.latched_command_index > self.command_count_threshold:
+            self.latched_command = command
+            self.latched_command_index = self.command_index
+        return self.latched_command
+    
+    def get(self) -> float:
+        return self.latched_command
+
+    def reset(self) -> None:
+        self.command_index = 0
+        self.latched_command_index = 0
+        self.latched_command = 0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1208,6 +1235,8 @@ def main() -> int:
     action_queue: Any = None  # RTC ActionQueue when --use-rtc
     rtc_inference_delay: int = 0
 
+    gripper_hold_requirement = GripperHoldRequirement(command_count_threshold=7)
+
     try:
         if args.log_actions_jsonl is not None:
             args.log_actions_jsonl.expanduser().parent.mkdir(parents=True, exist_ok=True)
@@ -1323,6 +1352,7 @@ def main() -> int:
                             "task": args.task,
                             "policy_features": policy_features,
                             "rtc_enabled": args.use_rtc,
+                            "ema_smoothing": get_ema_alpha(),
                             "cameras": camera_previews,
                         },
                         indent=2,
@@ -1442,12 +1472,13 @@ def main() -> int:
                     ema_prev_joints = None
                     if policy is not None:
                         policy.reset()
-                    operator_rehome_pause = True
                     if action_queue is not None:
                         action_queue.clear()
                         rtc_needs_inference = True
+                    operator_rehome_pause = True
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
+                    gripper_hold_requirement.reset()
                     log_event_marker(
                         "operator_rehome_requested",
                         sequence_id,
@@ -1493,8 +1524,11 @@ def main() -> int:
             request_rehome = rehome_request_retries_remaining > 0
             enabled = (not operator_paused) and not request_rehome
 
-            if args.zero_actions or operator_paused:
+            if args.zero_actions:
                 raw_action = _current_hold_action(obs)
+            elif operator_paused:
+                hold_gripper_command = 0.0 if operator_rehome_pause else None
+                raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
             elif args.use_rtc:
                 # ---- RTC path: chunk-based with ActionQueue ----
                 assert policy is not None
@@ -1548,9 +1582,6 @@ def main() -> int:
                     # Queue unexpectedly empty; hold current position and re-trigger inference.
                     raw_action = _current_hold_action(obs)
                     rtc_needs_inference = True
-            elif operator_paused:
-                hold_gripper_command = 0.0 if operator_rehome_pause else None
-                raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
             else:
                 # ---- Sync path: select_action (existing behavior, unchanged) ----
                 assert policy is not None
@@ -1576,6 +1607,7 @@ def main() -> int:
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
 
             action, gripper_command, clamp_info = _clamp_action_with_info(raw_action)
+            gripper_hold_requirement.update(gripper_command) # Apply the hold requirement to the gripper command
             model_output_log = _model_output_log_fields(raw_action)
             alpha = get_ema_alpha()
             ema_applied = ema_prev_joints is not None and not operator_paused and alpha < 1.0
@@ -1596,6 +1628,7 @@ def main() -> int:
                 "request_rehome": request_rehome,
                 "action_space": "joint_position_absolute",
                 "gripper_command": gripper_command,
+                "latched_gripper_command": gripper_hold_requirement.get(),
                 "raw_joint_positions_rad": _jsonable_action(raw_action),
                 "clamped_joint_positions_rad": _jsonable_action(action),
                 "ema_alpha": alpha,
@@ -1610,7 +1643,7 @@ def main() -> int:
                 dst,
                 sequence_id,
                 action,
-                gripper_command,
+                gripper_hold_requirement.get(),
                 enabled=enabled,
                 operator_request_id=operator_request_id,
                 request_rehome=request_rehome,
