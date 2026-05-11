@@ -20,19 +20,27 @@ SVLA_3, rtc on, ema_alpha 0.6:
 - couple of very good grasps, less good at final positioning?
 - then started going low + forward
 
-Drive the orange connector inside the slot
+"Drive the orange connector inside the slot"
 - low grasps, fairly centred
-
-push the orange MSD connector into the port
+"
+push the orange MSD connector into the port"
 - rear grasps, plug was generally forward of the socket though it did track backward, without full insertion
 
-push the orange MSD connector inside the slot
+"push the orange MSD connector inside the slot"
 - hesitant on grasp, high grasps
 
-push the orange MSD connector securely into the socket
+"push the orange MSD connector securely into the socket"
 - SUCCESS
 - Generally good grasp positions, not always commital
 - When rtc disabled, excellent grasps but not high enough to clear the socket edge
+
+SVLA_2, rtc on, ema_alpha 0.6:
+
+"push the orange MSD connector securely into the socket"
+- inconsistent grasp behaviour
+- grasps are either forward or central
+- when it gets it right, its able to get close to an insertion, but doesnt time releases correctly
+  - it adjusts back and forth seemingly semi-randomly, does hit good release positions, but fails to
 
 ACT_2
 
