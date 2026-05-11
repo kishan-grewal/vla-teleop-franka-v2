@@ -69,6 +69,9 @@ POLICY_REGISTRY: dict[str, Callable[[], Any]] = {
     "pi0": _load_pi0_policy_class,
 }
 
+# RTC-compatible policy types (flow-matching based).
+RTC_COMPATIBLE_POLICY_TYPES: set[str] = {"smolvla", "pi0"}
+
 
 with contextlib.suppress(ImportError):
     import termios
@@ -661,6 +664,18 @@ def _feature_image_shape(policy: Any, key: str, fallback_hw: tuple[int, int]) ->
     return fallback_hw
 
 
+def _action_sequence_from_chunk(action_chunk: Any, name: str) -> Any:
+    """Return a single action sequence shaped (time_steps, action_dim)."""
+    ndim = getattr(action_chunk, "ndim", None)
+    if ndim == 3:
+        if int(action_chunk.shape[0]) != 1:
+            raise ValueError(f"{name} has batch size {action_chunk.shape[0]}; only batch size 1 is supported")
+        return action_chunk.squeeze(0)
+    if ndim == 2:
+        return action_chunk
+    raise ValueError(f"{name} must have shape (1, T, A) or (T, A), got {tuple(action_chunk.shape)}")
+
+
 def _clamp_action_with_info(action: np.ndarray) -> tuple[np.ndarray, float, dict[str, Any]]:
     action = np.asarray(action, dtype=np.float64).reshape(-1).copy()
     if action.shape[0] != POLICY_ACTION_DIM:
@@ -897,6 +912,77 @@ def _list_available_cameras() -> int:
     return 0
 
 
+def _measure_inference_delay(
+    policy: Any,
+    preprocess: Any,
+    postprocess: Any,
+    prepare_observation_for_inference: Any,
+    camera_sources: list[_CameraSource],
+    obs: dict[str, Any],
+    policy_state_dim: int,
+    device: Any,
+    task: str,
+    robot_type: str,
+    rate_hz: float,
+    warmup_iters: int = 3,
+    measure_iters: int = 5,
+) -> int:
+    """Measure actual inference latency and convert to action steps at the given rate."""
+    import torch
+
+    raw_observation = {
+        OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
+        **_read_images(camera_sources),
+    }
+    frame = prepare_observation_for_inference(
+        raw_observation,
+        device,
+        task=task,
+        robot_type=robot_type,
+    )
+
+    # Warmup
+    for _ in range(warmup_iters):
+        with torch.inference_mode():
+            _ = policy.predict_action_chunk(preprocess(frame))
+
+    # Measure
+    times: list[float] = []
+    for _ in range(measure_iters):
+        start = time.monotonic()
+        with torch.inference_mode():
+            _ = policy.predict_action_chunk(preprocess(frame))
+        times.append(time.monotonic() - start)
+
+    median_s = float(np.median(times))
+    step_period_s = 1.0 / rate_hz
+    inference_delay = max(1, int(np.ceil(median_s / step_period_s)))
+    print(
+        f"RTC inference delay measurement: median={median_s * 1000:.1f}ms "
+        f"step_period={step_period_s * 1000:.1f}ms inference_delay={inference_delay} steps",
+        flush=True,
+    )
+    return inference_delay
+
+
+def _validate_rtc_flags(args: argparse.Namespace) -> None:
+    """Error if RTC-specific flags are set without --use-rtc."""
+    if args.use_rtc:
+        return
+    rtc_flags: dict[str, Any] = {
+        "--rtc-execution-horizon": (args.rtc_execution_horizon, 0),
+        "--rtc-max-guidance-weight": (args.rtc_max_guidance_weight, 10.0),
+        "--rtc-attention-schedule": (args.rtc_attention_schedule, "EXP"),
+        "--rtc-inference-delay": (args.rtc_inference_delay, 0),
+    }
+    non_default = [flag for flag, (value, default) in rtc_flags.items() if value != default]
+    if non_default:
+        raise ValueError(
+            f"RTC flags {', '.join(non_default)} were set but --use-rtc is not enabled. "
+            "Either add --use-rtc or remove the RTC-specific flags."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -994,6 +1080,60 @@ def parse_args() -> argparse.Namespace:
             "Example: echo '{\"ema_alpha\": 0.3}' | nc -u -w1 127.0.0.1 28090"
         ),
     )
+
+    # --- RTC flags ---
+    parser.add_argument(
+        "--use-rtc",
+        action="store_true",
+        help=(
+            "Enable Real-Time Chunking (RTC) for smooth inter-chunk transitions. "
+            "Uses predict_action_chunk + ActionQueue instead of select_action. "
+            "Compatible with flow-matching policies (smolvla, pi0)."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-execution-horizon",
+        type=int,
+        default=0,
+        help=(
+            "RTC: how many steps to execute before re-observing and re-inferring. "
+            "0 (default) auto-sets to the measured inference_delay for maximum "
+            "reactivity — fresh observations as often as physically possible. "
+            "Higher values reduce inference frequency (smoother but less reactive). "
+            "Only used when --use-rtc is set. (default: 0 = auto)"
+        ),
+    )
+    parser.add_argument(
+        "--rtc-max-guidance-weight",
+        type=float,
+        default=10.0,
+        help=(
+            "RTC: how strongly to enforce consistency with the previous chunk during "
+            "flow-matching denoising. 10.0 is optimal for 10-step flow matching "
+            "(SmolVLA, Pi0). Only used when --use-rtc is set. (default: 10.0)"
+        ),
+    )
+    parser.add_argument(
+        "--rtc-attention-schedule",
+        choices=["EXP", "LINEAR", "ONES", "ZEROS"],
+        default="EXP",
+        help=(
+            "RTC: how guidance weight decays across the overlap region. "
+            "EXP (exponential) is recommended. Only used when --use-rtc is set. "
+            "(default: EXP)"
+        ),
+    )
+    parser.add_argument(
+        "--rtc-inference-delay",
+        type=int,
+        default=0,
+        help=(
+            "RTC: how many action steps the robot advances during one inference call. "
+            "0 means auto-measure at startup by timing a few inference passes. "
+            "Only used when --use-rtc is set. (default: 0 = auto)"
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -1012,6 +1152,12 @@ def main() -> int:
         raise ValueError("--camera-preview-samples must be > 0")
     if not (0.0 < args.ema_alpha <= 1.0):
         raise ValueError("--ema-alpha must be in (0, 1]")
+    _validate_rtc_flags(args)
+    if args.use_rtc and args.policy_type not in RTC_COMPATIBLE_POLICY_TYPES:
+        raise ValueError(
+            f"--use-rtc is not compatible with --policy-type {args.policy_type!r}. "
+            f"RTC requires a flow-matching policy: {sorted(RTC_COMPATIBLE_POLICY_TYPES)}"
+        )
 
     deployment_config: dict[str, Any] = {}
     if args.config is not None:
@@ -1059,6 +1205,8 @@ def main() -> int:
     camera_sources: list[_CameraSource] = []
     action_log: TextIO | None = None
     preview_dir: Path | None = None
+    action_queue: Any = None  # RTC ActionQueue when --use-rtc
+    rtc_inference_delay: int = 0
 
     try:
         if args.log_actions_jsonl is not None:
@@ -1094,7 +1242,38 @@ def main() -> int:
 
             device = torch.device(args.device)
             policy_path = str(_resolve_policy_path(args.policy_path))
-            policy = policy_class.from_pretrained(policy_path)
+
+            # Configure RTC on the policy config before loading if requested.
+            if args.use_rtc:
+                from lerobot.configs import RTCAttentionSchedule
+                from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+                schedule_map = {
+                    "EXP": RTCAttentionSchedule.EXP,
+                    "LINEAR": RTCAttentionSchedule.LINEAR,
+                    "ONES": RTCAttentionSchedule.ONES,
+                    "ZEROS": RTCAttentionSchedule.ZEROS,
+                }
+
+                # Use a temporary execution_horizon; will be updated after
+                # measuring inference delay if the user didn't set it explicitly.
+                initial_execution_horizon = args.rtc_execution_horizon if args.rtc_execution_horizon > 0 else 10
+
+                rtc_config = RTCConfig(
+                    enabled=True,
+                    execution_horizon=initial_execution_horizon,
+                    max_guidance_weight=args.rtc_max_guidance_weight,
+                    prefix_attention_schedule=schedule_map[args.rtc_attention_schedule],
+                )
+
+                # Load normally, then apply RTC config after loading since
+                # from_pretrained loads config from the checkpoint.
+                policy = policy_class.from_pretrained(policy_path)
+                policy.config.rtc_config = rtc_config
+                policy.init_rtc_processor()
+            else:
+                policy = policy_class.from_pretrained(policy_path)
+
             policy.to(device)
             policy.eval()
             image_keys = _obs_keys_from_config(deployment_config)
@@ -1143,6 +1322,7 @@ def main() -> int:
                             "policy_path": policy_path,
                             "task": args.task,
                             "policy_features": policy_features,
+                            "rtc_enabled": args.use_rtc,
                             "cameras": camera_previews,
                         },
                         indent=2,
@@ -1156,13 +1336,73 @@ def main() -> int:
                 f"Loaded {args.policy_type} policy ({policy_class.__name__}) from {policy_path}",
                 flush=True,
             )
+
+            # RTC: initialize ActionQueue and measure inference delay.
+            if args.use_rtc:
+                from lerobot.policies.rtc.action_queue import ActionQueue
+
+                # Wait for a robot observation before measuring inference delay.
+                print("RTC: waiting for robot observation to measure inference delay...", flush=True)
+                while obs_rx.latest() is None:
+                    time.sleep(0.05)
+
+                if args.rtc_inference_delay > 0:
+                    rtc_inference_delay = args.rtc_inference_delay
+                    print(f"RTC: using manually set inference_delay={rtc_inference_delay} steps", flush=True)
+                else:
+                    rtc_inference_delay = _measure_inference_delay(
+                        policy=policy,
+                        preprocess=preprocess,
+                        postprocess=postprocess,
+                        prepare_observation_for_inference=prepare_observation_for_inference,
+                        camera_sources=camera_sources,
+                        obs=obs_rx.latest(),
+                        policy_state_dim=policy_state_dim,
+                        device=device,
+                        task=args.task,
+                        robot_type=args.robot_type,
+                        rate_hz=args.rate_hz,
+                    )
+
+                # Auto-derive execution_horizon from measured inference_delay
+                # for maximum reactivity (re-observe as often as possible).
+                if args.rtc_execution_horizon <= 0:
+                    final_execution_horizon = rtc_inference_delay
+                    print(
+                        f"RTC: auto-set execution_horizon={final_execution_horizon} "
+                        f"(= inference_delay) for maximum reactivity",
+                        flush=True,
+                    )
+                else:
+                    final_execution_horizon = args.rtc_execution_horizon
+                    if final_execution_horizon < rtc_inference_delay:
+                        print(
+                            f"WARNING: --rtc-execution-horizon {final_execution_horizon} is less than "
+                            f"measured inference_delay {rtc_inference_delay}. The action queue may "
+                            f"drain before new chunks arrive, causing gaps.",
+                            flush=True,
+                        )
+
+                # Update the RTCConfig with the final execution_horizon and
+                # recreate the ActionQueue with the correct config.
+                policy.config.rtc_config.execution_horizon = final_execution_horizon
+                action_queue = ActionQueue(policy.config.rtc_config)
+
+                print(
+                    f"RTC ready: execution_horizon={final_execution_horizon} "
+                    f"inference_delay={rtc_inference_delay} "
+                    f"max_guidance_weight={args.rtc_max_guidance_weight} "
+                    f"attention_schedule={args.rtc_attention_schedule}",
+                    flush=True,
+                )
         else:
             torch = None
             prepare_observation_for_inference = None
 
         print(
             f"Streaming policy joint targets to udp://{args.bridge_ip}:{args.action_port} "
-            f"from observations udp://{args.obs_bind_ip}:{args.obs_port}",
+            f"from observations udp://{args.obs_bind_ip}:{args.obs_port}"
+            f"{' (RTC enabled)' if args.use_rtc else ''}",
             flush=True,
         )
         keyboard.start()
@@ -1184,6 +1424,7 @@ def main() -> int:
         operator_rehome_pause = False
         operator_request_id = 0
         rehome_request_retries_remaining = 0
+        rtc_needs_inference = True  # RTC: trigger first inference immediately
         while True:
             start = time.monotonic()
             for key in keyboard.poll():
@@ -1192,6 +1433,9 @@ def main() -> int:
                     operator_paused = True
                     operator_rehome_pause = False
                     ema_prev_joints = None
+                    if action_queue is not None:
+                        action_queue.clear()
+                        rtc_needs_inference = True
                     print("Policy paused by operator.", flush=True)
                 elif normalized == "h":
                     operator_paused = True
@@ -1199,6 +1443,9 @@ def main() -> int:
                     if policy is not None:
                         policy.reset()
                     operator_rehome_pause = True
+                    if action_queue is not None:
+                        action_queue.clear()
+                        rtc_needs_inference = True
                     operator_request_id += 1
                     rehome_request_retries_remaining = REHOME_REQUEST_REPEAT_PACKETS
                     log_event_marker(
@@ -1224,6 +1471,7 @@ def main() -> int:
                         operator_paused=False,
                         operator_rehome_pause=False,
                     )
+                    rtc_needs_inference = True
                     print("Policy resume requested by operator.", flush=True)
                 elif normalized == "q":
                     log_event_marker(
@@ -1244,12 +1492,67 @@ def main() -> int:
             sequence_id += 1
             request_rehome = rehome_request_retries_remaining > 0
             enabled = (not operator_paused) and not request_rehome
-            if args.zero_actions:
+
+            if args.zero_actions or operator_paused:
                 raw_action = _current_hold_action(obs)
+            elif args.use_rtc:
+                # ---- RTC path: chunk-based with ActionQueue ----
+                assert policy is not None
+                assert preprocess is not None
+                assert postprocess is not None
+                assert policy_state_dim is not None
+                assert action_queue is not None
+                assert torch is not None
+                assert prepare_observation_for_inference is not None
+
+                # Check if we need to run inference (queue running low or first call).
+                queue_empty = action_queue.empty()
+                if rtc_needs_inference or queue_empty:
+                    raw_observation = {
+                        OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
+                        **_read_images(camera_sources),
+                    }
+                    frame = prepare_observation_for_inference(
+                        raw_observation,
+                        torch.device(args.device),
+                        task=args.task,
+                        robot_type=args.robot_type,
+                    )
+
+                    prev_actions = action_queue.get_left_over()
+
+                    action_chunk = policy.predict_action_chunk(
+                        preprocess(frame),
+                        inference_delay=rtc_inference_delay,
+                        prev_chunk_left_over=prev_actions,
+                    )
+                    with torch.no_grad():
+                        processed_action_chunk = postprocess(action_chunk.clone())
+
+                    original_actions = _action_sequence_from_chunk(action_chunk, "RTC action chunk").clone()
+                    processed_actions = _action_sequence_from_chunk(
+                        processed_action_chunk,
+                        "postprocessed RTC action chunk",
+                    )
+                    action_queue.merge(original_actions, processed_actions, rtc_inference_delay)
+                    rtc_needs_inference = False
+
+                # Pop one action from the queue.
+                raw_action = action_queue.get()
+                if raw_action is not None:
+                    raw_action = raw_action.squeeze(0).detach().cpu().numpy()
+                    # Schedule next inference when queue is getting low.
+                    if action_queue.qsize() <= rtc_inference_delay:
+                        rtc_needs_inference = True
+                else:
+                    # Queue unexpectedly empty; hold current position and re-trigger inference.
+                    raw_action = _current_hold_action(obs)
+                    rtc_needs_inference = True
             elif operator_paused:
                 hold_gripper_command = 0.0 if operator_rehome_pause else None
                 raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
             else:
+                # ---- Sync path: select_action (existing behavior, unchanged) ----
                 assert policy is not None
                 assert preprocess is not None
                 assert postprocess is not None
@@ -1282,7 +1585,7 @@ def main() -> int:
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
-                "source": "zero_actions" if args.zero_actions else "policy",
+                "source": "zero_actions" if args.zero_actions else ("rtc" if args.use_rtc else "policy"),
                 "policy_type": None if args.zero_actions else args.policy_type,
                 "task": args.task,
                 "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
@@ -1297,8 +1600,10 @@ def main() -> int:
                 "clamped_joint_positions_rad": _jsonable_action(action),
                 "ema_alpha": alpha,
                 "ema_applied": ema_applied,
-                **model_output_log,
+                "rtc_enabled": args.use_rtc,
+                "rtc_inference_delay": rtc_inference_delay if args.use_rtc else None,
                 **clamp_info,
+                **model_output_log,
             })
             _send_action(
                 action_sock,
