@@ -1,3 +1,12 @@
+SVLA_1: datasets 200-204
+SVLA_2: datasets 200-209
+SVLA_3: datasets 205-209
+SVLA_4: datasets 200-209, penultimate checkpoint
+act_1: datasets 200-209
+
+
+SVLA_3, rtc on, ema_alpha 0.6:
+
 "insert the orange MSD connector inside the orange socket"
 - Decent, generally grasped the back half of the plug
 
@@ -22,3 +31,33 @@ push the orange MSD connector inside the slot
 
 push the orange MSD connector securely into the socket
 - SUCCESS
+- Generally good grasp positions, not always commital
+- When rtc disabled, excellent grasps but not high enough to clear the socket edge
+
+ACT_2
+
+ema 0.6
+- good, initial grasp was excellent, got over the socket but couldnt position in fully
+- other attempts grasped too high + travelled too low to make it over the socket wall
+
+ema 0.8
+- no noticeable smoothness change
+- same too high+too low combination of grasp/travel
+
+ema 1.0
+- slight noticeable change in the judders - present in all variants but least damped here
+- one successful insertion - got over in the same was as the 0.6 case, judder pushed it in
+  - didnt look like comprehensive control, more like luck - cycled the judder several times
+    at regular intervals, then happened to slot in
+- further testing with more positional range showed it can grasp well in a small region
+  - outside that, it either completely misses or grasps the edge of the handle
+  - this then causes it to completely miss the target, 
+    - misjudging it (grasped from the front) and bending the handle
+    - freezing on approach (grasped from the back)
+
+Async chunk tests 1
+- ACT
+  - Increased jerk severity
+- SmolVLA
+  - Introduced significant oscillation/jerky behaviour which destabilised the pathing
+(rolled back, present on origin/feat/async-chunking)

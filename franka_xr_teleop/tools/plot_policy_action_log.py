@@ -194,7 +194,7 @@ def make_figure(action_t_s: np.ndarray, joint_array: np.ndarray, gripper_array: 
     style_axis(gripper_ax, "Gripper")
     gripper_ax.set_xlabel("Time [s]")
     add_legend(gripper_ax)
-    # gripper_ax.set_xlim(10,15)
+    # gripper_ax.set_xlim(148,160)
 
     fig.suptitle("Policy Raw Outputs and Rehome/Resume Markers")
     fig.tight_layout()
