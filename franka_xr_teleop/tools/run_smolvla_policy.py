@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, TextIO
 
 import numpy as np
 
+from policy_camera_recorder import PolicyCameraRecorder
 from record_realsense_camera import import_dependencies as import_realsense_dependencies
 from record_zed_camera import import_dependencies as import_zed_dependencies
 from record_zed_camera import timestamp_to_ns as zed_timestamp_to_ns
@@ -177,6 +178,16 @@ def _read_images(sources: list[_CameraSource]) -> dict[str, np.ndarray]:
         for source, image in zip(zed_sources, results):
             images[source.obs_key] = image
     return images
+
+
+def _camera_properties_by_obs_key(sources: list[_CameraSource]) -> dict[str, dict[str, Any]]:
+    properties: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        if source.zed_view is not None:
+            properties[source.obs_key] = source.camera.properties(source.zed_view)
+        else:
+            properties[source.obs_key] = source.camera.properties()
+    return properties
 
 
 def _ensure_supported_python() -> None:
@@ -738,6 +749,27 @@ def _write_jsonl(handle: TextIO | None, row: dict[str, Any]) -> None:
     handle.flush()
 
 
+def _camera_recorder_timing_log_fields(stats: dict[str, Any]) -> dict[str, Any]:
+    timing_prefixes = (
+        "submit_api_",
+        "submit_drop_api_",
+        "snapshot_api_",
+        "queue_wait_batch_",
+        "write_batch_",
+        "stream_lookup_frame_",
+        "rgb_convert_frame_",
+        "video_write_frame_",
+        "jsonl_serialize_frame_",
+        "jsonl_write_frame_",
+        "frame_total_",
+    )
+    return {
+        f"policy_camera_recording_{key}": value
+        for key, value in stats.items()
+        if key.startswith(timing_prefixes)
+    }
+
+
 def _jsonable_action(action: np.ndarray) -> list[float]:
     return [float(v) for v in np.asarray(action, dtype=np.float64).reshape(-1)]
 
@@ -994,6 +1026,7 @@ class RTCActionProducer:
         postprocess: Any,
         prepare_observation_for_inference: Any,
         camera_sources: list[_CameraSource],
+        camera_recorder: PolicyCameraRecorder | None,
         obs_rx: LatestRobotObservation,
         action_queue: Any,
         policy_state_dim: int,
@@ -1010,6 +1043,7 @@ class RTCActionProducer:
         self._postprocess = postprocess
         self._prepare_observation_for_inference = prepare_observation_for_inference
         self._camera_sources = camera_sources
+        self._camera_recorder = camera_recorder
         self._obs_rx = obs_rx
         self._action_queue = action_queue
         self._policy_state_dim = policy_state_dim
@@ -1036,6 +1070,11 @@ class RTCActionProducer:
         self._last_refill_reason: str | None = None
         self._last_total_ms: float | None = None
         self._last_model_ms: float | None = None
+        self._last_camera_read_ms: float | None = None
+        self._last_recorder_submit_ms: float | None = None
+        self._last_observation_prepare_ms: float | None = None
+        self._last_preprocess_ms: float | None = None
+        self._last_postprocess_ms: float | None = None
         self._last_merge_delay_steps: int | None = None
         self._last_queue_advance_steps: int | None = None
         self._last_prev_leftover_len: int | None = None
@@ -1110,7 +1149,12 @@ class RTCActionProducer:
                 "rtc_last_merge_delay": self._last_merge_delay_steps,
                 "rtc_last_queue_advance_steps": self._last_queue_advance_steps,
                 "rtc_last_chunk_total_ms": self._last_total_ms,
+                "rtc_last_camera_read_ms": self._last_camera_read_ms,
+                "rtc_last_recorder_submit_ms": self._last_recorder_submit_ms,
+                "rtc_last_observation_prepare_ms": self._last_observation_prepare_ms,
+                "rtc_last_preprocess_ms": self._last_preprocess_ms,
                 "rtc_last_model_inference_ms": self._last_model_ms,
+                "rtc_last_postprocess_ms": self._last_postprocess_ms,
                 "rtc_last_refill_reason": self._last_refill_reason,
                 "rtc_last_prev_leftover_len": self._last_prev_leftover_len,
                 "rtc_last_action_index_before_inference": self._last_action_index_before_inference,
@@ -1162,20 +1206,44 @@ class RTCActionProducer:
                 self._last_prev_leftover_len = prev_leftover_len
                 self._last_action_index_before_inference = action_index_before_inference
                 self._busy = True
+                inference_index = self._inference_count + 1
 
             try:
                 start = time.monotonic()
+                camera_read_start = time.monotonic()
+                images = _read_images(self._camera_sources)
+                camera_read_ms = (time.monotonic() - camera_read_start) * 1000.0
+                recorder_submit_ms = 0.0
+                if self._camera_recorder is not None:
+                    recorder_submit_start = time.monotonic()
+                    self._camera_recorder.submit(
+                        images,
+                        metadata={
+                            "source": "rtc",
+                            "rtc_inference_index": inference_index,
+                            "rtc_generation": generation,
+                            "rtc_refill_reason": refill_reason,
+                            "rtc_action_index_before_inference": action_index_before_inference,
+                            "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                            "camera_properties": _camera_properties_by_obs_key(self._camera_sources),
+                        },
+                    )
+                    recorder_submit_ms = (time.monotonic() - recorder_submit_start) * 1000.0
                 raw_observation = {
                     OBS_STATE_KEY: _robot_state_vector(obs, self._policy_state_dim),
-                    **_read_images(self._camera_sources),
+                    **images,
                 }
+                observation_prepare_start = time.monotonic()
                 frame = self._prepare_observation_for_inference(
                     raw_observation,
                     self._device,
                     task=self._task,
                     robot_type=self._robot_type,
                 )
+                observation_prepare_ms = (time.monotonic() - observation_prepare_start) * 1000.0
+                preprocess_start = time.monotonic()
                 preprocessed_frame = self._preprocess(frame)
+                preprocess_ms = (time.monotonic() - preprocess_start) * 1000.0
                 model_start = time.monotonic()
                 action_chunk = self._policy.predict_action_chunk(
                     preprocessed_frame,
@@ -1183,12 +1251,14 @@ class RTCActionProducer:
                     prev_chunk_left_over=prev_actions,
                 )
                 model_elapsed_s = time.monotonic() - model_start
+                postprocess_start = time.monotonic()
                 processed_action_chunk = self._postprocess(action_chunk.clone())
                 original_actions = _action_sequence_from_chunk(action_chunk, "RTC action chunk").clone()
                 processed_actions = _action_sequence_from_chunk(
                     processed_action_chunk,
                     "postprocessed RTC action chunk",
                 )
+                postprocess_ms = (time.monotonic() - postprocess_start) * 1000.0
                 total_elapsed_s = time.monotonic() - start
                 merge_delay_steps = max(1, int(math.ceil(total_elapsed_s / self._period_s)))
 
@@ -1206,6 +1276,11 @@ class RTCActionProducer:
                         self._current_delay_steps = merge_delay_steps
                         self._last_total_ms = total_elapsed_s * 1000.0
                         self._last_model_ms = model_elapsed_s * 1000.0
+                        self._last_camera_read_ms = camera_read_ms
+                        self._last_recorder_submit_ms = recorder_submit_ms
+                        self._last_observation_prepare_ms = observation_prepare_ms
+                        self._last_preprocess_ms = preprocess_ms
+                        self._last_postprocess_ms = postprocess_ms
                         self._last_merge_delay_steps = merge_delay_steps
                         self._last_queue_advance_steps = queue_advance_steps
                         self._inference_count += 1
@@ -1341,6 +1416,38 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSONL path for raw/clamped joint targets and clamp metadata.",
     )
     parser.add_argument(
+        "--record-policy-cameras",
+        action="store_true",
+        help="Asynchronously record the camera frames actually submitted to the policy.",
+    )
+    parser.add_argument(
+        "--policy-camera-recording-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory for --record-policy-cameras. Defaults to "
+            "<preview-dir>/<timestamp>/policy_cameras, or policy_camera_recordings/<timestamp> "
+            "when preview frames are skipped."
+        ),
+    )
+    parser.add_argument(
+        "--policy-camera-recording-queue-size",
+        type=int,
+        default=4,
+        help="Bounded batch queue for async policy camera recording; full queues drop frames instead of blocking.",
+    )
+    parser.add_argument(
+        "--policy-camera-video-codec",
+        default="mp4v",
+        help="OpenCV fourcc for policy camera rgb.mp4 files.",
+    )
+    parser.add_argument(
+        "--policy-camera-video-fps",
+        type=float,
+        default=0.0,
+        help="Playback FPS for policy camera videos. 0 uses --rate-hz.",
+    )
+    parser.add_argument(
         "--zero-actions",
         action="store_true",
         help="Hold the current measured joint configuration without loading any policy; useful for bridge smoke tests.",
@@ -1445,6 +1552,12 @@ def main() -> int:
         raise ValueError("--camera-preview-samples must be > 0")
     if not (0.0 < args.ema_alpha <= 1.0):
         raise ValueError("--ema-alpha must be in (0, 1]")
+    if args.record_policy_cameras and args.zero_actions:
+        raise ValueError("--record-policy-cameras requires a loaded policy; remove --zero-actions")
+    if args.policy_camera_recording_queue_size <= 0:
+        raise ValueError("--policy-camera-recording-queue-size must be > 0")
+    if args.policy_camera_video_fps < 0.0:
+        raise ValueError("--policy-camera-video-fps must be >= 0")
     if args.rtc_refill_threshold < 0:
         raise ValueError("--rtc-refill-threshold must be >= 0")
     _validate_rtc_flags(args)
@@ -1498,6 +1611,7 @@ def main() -> int:
     postprocess = None
     policy_state_dim = None
     camera_sources: list[_CameraSource] = []
+    camera_recorder: PolicyCameraRecorder | None = None
     action_log: TextIO | None = None
     preview_dir: Path | None = None
     action_queue: Any = None  # RTC ActionQueue when --use-rtc
@@ -1589,6 +1703,16 @@ def main() -> int:
             fallback_hw = (args.camera_height, args.camera_width)
             camera_sources = _build_camera_sources(deployment_config, policy, fallback_hw)
             preview_dir = None if args.skip_preview_frames else _timestamped_preview_dir(args.preview_dir)
+            camera_recording_dir: Path | None = None
+            if args.record_policy_cameras:
+                if not camera_sources:
+                    raise ValueError("--record-policy-cameras requested, but no enabled policy cameras were configured")
+                if args.policy_camera_recording_dir is not None:
+                    camera_recording_dir = args.policy_camera_recording_dir.expanduser()
+                elif preview_dir is not None:
+                    camera_recording_dir = preview_dir / "policy_cameras"
+                else:
+                    camera_recording_dir = _timestamped_preview_dir(Path("policy_camera_recordings"))
             if action_log is None and preview_dir is not None:
                 default_log_path = preview_dir / "policy_actions.jsonl"
                 default_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1623,6 +1747,10 @@ def main() -> int:
                             "policy_features": policy_features,
                             "rtc_enabled": args.use_rtc,
                             "ema_smoothing": get_ema_alpha(),
+                            "policy_camera_recording_enabled": args.record_policy_cameras,
+                            "policy_camera_recording_dir": (
+                                None if camera_recording_dir is None else str(camera_recording_dir)
+                            ),
                             "cameras": camera_previews,
                         },
                         indent=2,
@@ -1632,6 +1760,31 @@ def main() -> int:
                     encoding="utf-8",
                 )
                 print(f"Saved camera preview manifest to {manifest_path}", flush=True)
+            if args.record_policy_cameras:
+                assert camera_recording_dir is not None
+                camera_recorder = PolicyCameraRecorder(
+                    camera_recording_dir,
+                    fps=args.policy_camera_video_fps or args.rate_hz,
+                    codec=args.policy_camera_video_codec,
+                    queue_size=args.policy_camera_recording_queue_size,
+                    metadata={
+                        "policy_type": args.policy_type,
+                        "policy_path": policy_path,
+                        "task": args.task,
+                        "robot_type": args.robot_type,
+                        "rate_hz": args.rate_hz,
+                        "rtc_enabled": args.use_rtc,
+                        "image_keys": list(image_keys),
+                        "policy_features": policy_features,
+                        "camera_previews": camera_previews,
+                    },
+                )
+                camera_recorder.start()
+                print(
+                    f"Policy camera recorder active at {camera_recorder.output_dir} "
+                    f"(queue_size={camera_recorder.queue_size}, codec={camera_recorder.codec}, fps={camera_recorder.fps:.2f})",
+                    flush=True,
+                )
             print(
                 f"Loaded {args.policy_type} policy ({policy_class.__name__}) from {policy_path}",
                 flush=True,
@@ -1695,6 +1848,7 @@ def main() -> int:
                     postprocess=postprocess,
                     prepare_observation_for_inference=prepare_observation_for_inference,
                     camera_sources=camera_sources,
+                    camera_recorder=camera_recorder,
                     obs_rx=obs_rx,
                     action_queue=action_queue,
                     policy_state_dim=policy_state_dim,
@@ -1822,17 +1976,30 @@ def main() -> int:
             sequence_id += 1
             request_rehome = rehome_request_retries_remaining > 0
             enabled = (not operator_paused) and not request_rehome
+            policy_timing_total_ms: float | None = None
+            policy_timing_camera_read_ms: float | None = None
+            policy_timing_recorder_submit_ms: float | None = None
+            policy_timing_observation_prepare_ms: float | None = None
+            policy_timing_preprocess_ms: float | None = None
+            policy_timing_model_ms: float | None = None
+            policy_timing_postprocess_ms: float | None = None
+            policy_timing_action_source_ms: float | None = None
 
             if args.zero_actions:
+                action_source_start = time.monotonic()
                 raw_action = _current_hold_action(obs)
+                policy_timing_action_source_ms = (time.monotonic() - action_source_start) * 1000.0
             elif operator_paused:
                 hold_gripper_command = 0.0 if operator_rehome_pause else None
+                action_source_start = time.monotonic()
                 raw_action = _current_hold_action(obs, gripper_command_override=hold_gripper_command)
+                policy_timing_action_source_ms = (time.monotonic() - action_source_start) * 1000.0
             elif args.use_rtc:
                 # ---- RTC path: consume queued chunks while a background thread infers ----
                 assert action_queue is not None
                 assert rtc_action_producer is not None
 
+                action_source_start = time.monotonic()
                 rtc_action_producer.raise_if_failed()
                 raw_action_tensor = action_queue.get()
                 if raw_action_tensor is not None:
@@ -1843,6 +2010,7 @@ def main() -> int:
                     # Queue is empty during startup or after an overrun; hold and wake the producer.
                     raw_action = _current_hold_action(obs)
                     rtc_action_producer.notify_queue_underrun()
+                policy_timing_action_source_ms = (time.monotonic() - action_source_start) * 1000.0
             else:
                 # ---- Sync path: select_action (existing behavior, unchanged) ----
                 assert policy is not None
@@ -1852,20 +2020,52 @@ def main() -> int:
                 assert torch is not None
                 assert prepare_observation_for_inference is not None
 
+                policy_inference_start = time.monotonic()
+                camera_read_start = time.monotonic()
+                images = _read_images(camera_sources)
+                policy_timing_camera_read_ms = (time.monotonic() - camera_read_start) * 1000.0
+                policy_timing_recorder_submit_ms = 0.0
+                if camera_recorder is not None:
+                    recorder_submit_start = time.monotonic()
+                    camera_recorder.submit(
+                        images,
+                        metadata={
+                            "source": "sync",
+                            "sequence_id": sequence_id,
+                            "robot_observation_timestamp_ns": obs.get("timestamp_ns"),
+                            "enabled": enabled,
+                            "operator_paused": operator_paused,
+                            "operator_rehome_pause": operator_rehome_pause,
+                            "operator_request_id": operator_request_id,
+                            "camera_properties": _camera_properties_by_obs_key(camera_sources),
+                        },
+                    )
+                    policy_timing_recorder_submit_ms = (time.monotonic() - recorder_submit_start) * 1000.0
                 raw_observation = {
                     OBS_STATE_KEY: _robot_state_vector(obs, policy_state_dim),
-                    **_read_images(camera_sources),
+                    **images,
                 }
+                observation_prepare_start = time.monotonic()
                 frame = prepare_observation_for_inference(
                     raw_observation,
                     torch.device(args.device),
                     task=args.task,
                     robot_type=args.robot_type,
                 )
+                policy_timing_observation_prepare_ms = (time.monotonic() - observation_prepare_start) * 1000.0
                 with torch.inference_mode():
-                    action_tensor = policy.select_action(preprocess(frame))
+                    preprocess_start = time.monotonic()
+                    preprocessed_frame = preprocess(frame)
+                    policy_timing_preprocess_ms = (time.monotonic() - preprocess_start) * 1000.0
+                    model_start = time.monotonic()
+                    action_tensor = policy.select_action(preprocessed_frame)
+                    policy_timing_model_ms = (time.monotonic() - model_start) * 1000.0
+                    postprocess_start = time.monotonic()
                     action_tensor = postprocess(action_tensor)
+                    policy_timing_postprocess_ms = (time.monotonic() - postprocess_start) * 1000.0
                 raw_action = action_tensor.squeeze(0).detach().cpu().numpy()
+                policy_timing_total_ms = (time.monotonic() - policy_inference_start) * 1000.0
+                policy_timing_action_source_ms = policy_timing_total_ms
 
             action, gripper_command, clamp_info = _clamp_action_with_info(raw_action)
             gripper_hold_requirement.update(gripper_command) # Apply the hold requirement to the gripper command
@@ -1880,6 +2080,16 @@ def main() -> int:
                 if args.use_rtc and rtc_action_producer is not None
                 else {}
             )
+            camera_recording_stats = camera_recorder.snapshot() if camera_recorder is not None else {}
+            camera_recording_timing_log = _camera_recorder_timing_log_fields(camera_recording_stats)
+            if args.use_rtc and rtc_log_fields:
+                policy_timing_total_ms = rtc_log_fields.get("rtc_last_chunk_total_ms")
+                policy_timing_camera_read_ms = rtc_log_fields.get("rtc_last_camera_read_ms")
+                policy_timing_recorder_submit_ms = rtc_log_fields.get("rtc_last_recorder_submit_ms")
+                policy_timing_observation_prepare_ms = rtc_log_fields.get("rtc_last_observation_prepare_ms")
+                policy_timing_preprocess_ms = rtc_log_fields.get("rtc_last_preprocess_ms")
+                policy_timing_model_ms = rtc_log_fields.get("rtc_last_model_inference_ms")
+                policy_timing_postprocess_ms = rtc_log_fields.get("rtc_last_postprocess_ms")
             _write_jsonl(action_log, {
                 "timestamp_ns": time.monotonic_ns(),
                 "sequence_id": sequence_id,
@@ -1899,6 +2109,18 @@ def main() -> int:
                 "clamped_joint_positions_rad": _jsonable_action(action),
                 "ema_alpha": alpha,
                 "ema_applied": ema_applied,
+                "policy_timing_total_inference_ms": policy_timing_total_ms,
+                "policy_timing_camera_read_ms": policy_timing_camera_read_ms,
+                "policy_timing_recorder_submit_ms": policy_timing_recorder_submit_ms,
+                "policy_timing_observation_prepare_ms": policy_timing_observation_prepare_ms,
+                "policy_timing_preprocess_ms": policy_timing_preprocess_ms,
+                "policy_timing_model_ms": policy_timing_model_ms,
+                "policy_timing_postprocess_ms": policy_timing_postprocess_ms,
+                "policy_timing_action_source_ms": policy_timing_action_source_ms,
+                "policy_camera_recording_enabled": camera_recorder is not None,
+                "policy_camera_recording_dropped_frames": camera_recording_stats.get("dropped_frames"),
+                "policy_camera_recording_queued_batches": camera_recording_stats.get("queued_batches"),
+                **camera_recording_timing_log,
                 "rtc_enabled": args.use_rtc,
                 "rtc_inference_delay": (
                     rtc_log_fields.get("rtc_current_inference_delay", rtc_inference_delay)
@@ -1933,6 +2155,21 @@ def main() -> int:
             rtc_action_producer.stop()
         if tuner is not None:
             tuner.stop()
+        if camera_recorder is not None:
+            camera_recorder.stop()
+            recorder_stats = camera_recorder.snapshot()
+            print(
+                "Policy camera recorder stopped: "
+                f"written_frames={recorder_stats['written_frames']} "
+                f"dropped_frames={recorder_stats['dropped_frames']} "
+                f"queued_batches={recorder_stats['queued_batches']} "
+                f"submit_avg_ms={recorder_stats['submit_api_avg_ms']} "
+                f"submit_max_ms={recorder_stats['submit_api_max_ms']} "
+                f"video_write_avg_ms={recorder_stats['video_write_frame_avg_ms']} "
+                f"video_write_max_ms={recorder_stats['video_write_frame_max_ms']} "
+                f"output_dir={recorder_stats['output_dir']}",
+                flush=True,
+            )
         obs_rx.stop()
         action_sock.close()
         if action_log is not None:
