@@ -20,6 +20,8 @@ from typing import Any, Callable, Optional, TextIO
 
 import numpy as np
 
+from scipy.signal import butter, lfilter, lfilter_zi
+
 from record_realsense_camera import import_dependencies as import_realsense_dependencies
 from record_zed_camera import import_dependencies as import_zed_dependencies
 from record_zed_camera import timestamp_to_ns as zed_timestamp_to_ns
@@ -1364,6 +1366,17 @@ def parse_args() -> argparse.Namespace:
             "Example: echo '{\"ema_alpha\": 0.3}' | nc -u -w1 127.0.0.1 28090"
         ),
     )
+    parser.add_argument(
+        "--butter-lowpass",
+        action="store_true",
+        help="Apply a butterworth lowpass filter to the joint actions.",
+    )
+    parser.add_argument(
+        "--butter-lowpass-cutoff",
+        type=float,
+        default=1.0,
+        help="Cutoff frequency for the butterworth lowpass filter.",
+    )
 
     # --- RTC flags ---
     parser.add_argument(
@@ -1429,6 +1442,24 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+# 1. Filter Design
+def design_butter_lowpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    # Return sos (second-order sections) for better numerical stability
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+# 2. Initialize filter state
+def init_filter(b, a):
+    zi = lfilter_zi(b, a)
+    return zi
+
+# 3. Real-time filter function
+def process_sample(sample, b, a, zi):
+    # lfilter returns filtered sample and new state
+    filtered, new_zi = lfilter(b, a, [sample], zi=zi)
+    return filtered[0], new_zi
 
 def main() -> int:
     _ensure_supported_python()
@@ -1506,6 +1537,8 @@ def main() -> int:
     rtc_refill_threshold: int | None = None
 
     gripper_hold_requirement = GripperHoldRequirement(command_count_threshold=7)
+    joint_filters = [design_butter_lowpass(cutoff=args.butter_lowpass_cutoff, fs=30.0, order=3) for _ in range(JOINT_ACTION_DIM)] # 1hz cuttoff, 30hz sampling
+    zi = None
 
     try:
         if args.log_actions_jsonl is not None:
@@ -1623,6 +1656,8 @@ def main() -> int:
                             "policy_features": policy_features,
                             "rtc_enabled": args.use_rtc,
                             "ema_smoothing": get_ema_alpha(),
+                            "butter_lowpass": args.butter_lowpass,
+                            "butter_lowpass_cutoff": args.butter_lowpass_cutoff,
                             "cameras": camera_previews,
                         },
                         indent=2,
@@ -1870,11 +1905,20 @@ def main() -> int:
             action, gripper_command, clamp_info = _clamp_action_with_info(raw_action)
             gripper_hold_requirement.update(gripper_command) # Apply the hold requirement to the gripper command
             model_output_log = _model_output_log_fields(raw_action)
+            
             alpha = get_ema_alpha()
             ema_applied = ema_prev_joints is not None and not operator_paused and alpha < 1.0
             if ema_applied:
                 action[:JOINT_ACTION_DIM] = alpha * action[:JOINT_ACTION_DIM] + (1.0 - alpha) * ema_prev_joints
             ema_prev_joints = action[:JOINT_ACTION_DIM].copy()
+
+            if args.butter_lowpass:
+                if zi is None:
+                    zi = [init_filter(*joint_filters[i])*action[i] for i in range(len(joint_filters))]
+
+                for i in range(JOINT_ACTION_DIM):
+                    action[i], zi[i] = process_sample(action[i], *joint_filters[i], zi[i])
+
             rtc_log_fields = (
                 rtc_action_producer.snapshot()
                 if args.use_rtc and rtc_action_producer is not None
@@ -1899,6 +1943,8 @@ def main() -> int:
                 "clamped_joint_positions_rad": _jsonable_action(action),
                 "ema_alpha": alpha,
                 "ema_applied": ema_applied,
+                "butter_lowpass": args.butter_lowpass,
+                "butter_lowpass_cutoff": args.butter_lowpass_cutoff,
                 "rtc_enabled": args.use_rtc,
                 "rtc_inference_delay": (
                     rtc_log_fields.get("rtc_current_inference_delay", rtc_inference_delay)

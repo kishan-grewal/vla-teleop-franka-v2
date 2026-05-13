@@ -2,6 +2,8 @@ SVLA_1: datasets 200-204
 SVLA_2: datasets 200-209
 SVLA_3: datasets 205-209
 SVLA_4: datasets 200-209, penultimate checkpoint
+SVLA_5: 200-209, reduced labels
+SVLA_6: 205-209, reduced labels
 act_1: datasets 200-209
 
 

@@ -14,7 +14,7 @@ cameras:
     enabled: true
     backend: realsense
     role: third_person
-    obs_key: observation.images.top
+    obs_key: observation.images.third_person_d405
     camera_name: third_person_d405
     serial: "128422271175"
     color_width: 1280
@@ -34,7 +34,7 @@ cameras:
     enabled: true
     backend: realsense
     role: wrist
-    obs_key: observation.images.wrist_d405
+    obs_key: observation.images.top
     camera_name: wrist_d405
     serial: "128422271845"
     color_width: 1280

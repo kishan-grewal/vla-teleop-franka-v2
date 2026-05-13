@@ -173,7 +173,6 @@ def add_legend(ax) -> None:
     if handles:
         ax.legend(loc="upper right", fontsize=8, ncol=2)
 
-
 def make_figure(action_t_s: np.ndarray, joint_array: np.ndarray, gripper_array: np.ndarray, latched_gripper_array: np.ndarray, event_t_s: dict[str, np.ndarray]):
     fig, axes = plt.subplots(JOINT_ACTION_DIM + 1, 1, figsize=(16, 20), sharex=True)
 
@@ -194,7 +193,7 @@ def make_figure(action_t_s: np.ndarray, joint_array: np.ndarray, gripper_array: 
     style_axis(gripper_ax, "Gripper")
     gripper_ax.set_xlabel("Time [s]")
     add_legend(gripper_ax)
-    # gripper_ax.set_xlim(148,160)
+    # gripper_ax.set_xlim(0,50)
 
     fig.suptitle("Policy Raw Outputs and Rehome/Resume Markers")
     fig.tight_layout()
