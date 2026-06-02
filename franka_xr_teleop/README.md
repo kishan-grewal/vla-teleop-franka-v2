@@ -150,7 +150,7 @@ controller input with absolute joint targets plus a gripper command over UDP:
 In another terminal, run the policy sidecar:
 
 ```bash
-./tools/run_smolvla_policy.py \
+./tools/run_vla_policy.py \
   --policy-path /home/kishan/industry-project/SmolVLA-Testing/outputs/001_smolvla \
   --obs-port 28081 \
   --bridge-ip 127.0.0.1 \
@@ -164,7 +164,7 @@ In another terminal, run the policy sidecar:
 (`outputs/<dataset>_smolvla`) or directly at a LeRobot checkpoint export such
 as `outputs/<dataset>_smolvla/checkpoints/last/pretrained_model`.
 
-When `run_smolvla_policy.py` is attached to a terminal, it also accepts live
+When `run_vla_policy.py` is attached to a terminal, it also accepts live
 operator keys:
 
 - `p`: pause policy actions (bridge receives `enabled=false`)
@@ -175,7 +175,7 @@ operator keys:
 For a bridge smoke test without loading a model or cameras:
 
 ```bash
-./tools/run_smolvla_policy.py --zero-actions --obs-port 28081 --action-port 28082
+./tools/run_vla_policy.py --zero-actions --obs-port 28081 --action-port 28082
 ```
 
 Record one dataset session from the UDP robot stream plus the configured

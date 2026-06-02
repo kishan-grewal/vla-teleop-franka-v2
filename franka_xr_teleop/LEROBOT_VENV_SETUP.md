@@ -1,7 +1,7 @@
 # LeRobot Venv Setup
 
 This note covers the full local setup flow for the `lerobot` environment used by
-`franka_xr_teleop/tools/run_smolvla_policy.py`, including installing the
+`franka_xr_teleop/tools/run_vla_policy.py`, including installing the
 RealSense Python bindings into the same venv.
 
 ## Recommended Setup
@@ -134,7 +134,7 @@ After the venv is set up:
 
 ```bash
 cd /home/radu/vla-teleop-franka-v2-model-deploy
-./lerobot/.venv/bin/python franka_xr_teleop/tools/run_smolvla_policy.py --help
+./lerobot/.venv/bin/python franka_xr_teleop/tools/run_vla_policy.py --help
 ```
 
 List both RealSense and ZED serials directly from the main runner:
@@ -142,7 +142,7 @@ List both RealSense and ZED serials directly from the main runner:
 ```bash
 cd /home/radu/vla-teleop-franka-v2-model-deploy
 source ./lerobot/.venv/bin/activate
-python franka_xr_teleop/tools/run_smolvla_policy.py --list-cameras
+python franka_xr_teleop/tools/run_vla_policy.py --list-cameras
 ```
 
 Example output:
@@ -158,7 +158,7 @@ Example launch:
 
 ```bash
 source ./lerobot/.venv/bin/activate
-python franka_xr_teleop/tools/run_smolvla_policy.py \
+python franka_xr_teleop/tools/run_vla_policy.py \
   --policy-path ./model/pretrained_model \
   --obs-port 28081 \
   --bridge-ip 127.0.0.1 \
@@ -273,7 +273,7 @@ List both RealSense and ZED devices from the main runner:
 
 ```bash
 /home/radu/vla-teleop-franka-v2-model-deploy/lerobot/.venv/bin/python \
-  /home/radu/vla-teleop-franka-v2-model-deploy/franka_xr_teleop/tools/run_smolvla_policy.py \
+  /home/radu/vla-teleop-franka-v2-model-deploy/franka_xr_teleop/tools/run_vla_policy.py \
   --list-cameras
 ```
 
@@ -284,4 +284,3 @@ source /home/radu/vla-teleop-franka-v2-model-deploy/lerobot/.venv/bin/activate
 cd /usr/local/zed
 python3 get_python_api.py
 ```
-

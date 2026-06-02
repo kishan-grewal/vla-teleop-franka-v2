@@ -66,7 +66,7 @@ def _load_pi0_policy_class() -> Any:
 
 # Registry of supported policy types. The value is a thin loader so the heavy
 # imports happen only when the user actually picks that policy. Add new
-# policies here (e.g. pi0fast, pi05) and they Just Work end-to-end.
+# policies here to expose them through --policy-type.
 POLICY_REGISTRY: dict[str, Callable[[], Any]] = {
     "smolvla": _load_smolvla_policy_class,
     "act": _load_act_policy_class,
@@ -1442,20 +1442,20 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
-# 1. Filter Design
+# Filter design
 def design_butter_lowpass(cutoff, fs, order=5):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
-    # Return sos (second-order sections) for better numerical stability
+    # Return numerator/denominator coefficients for the low-pass filter.
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
     return b, a
 
-# 2. Initialize filter state
+# Filter state initialization
 def init_filter(b, a):
     zi = lfilter_zi(b, a)
     return zi
 
-# 3. Real-time filter function
+# Per-sample filtering
 def process_sample(sample, b, a, zi):
     # lfilter returns filtered sample and new state
     filtered, new_zi = lfilter(b, a, [sample], zi=zi)
@@ -1537,7 +1537,7 @@ def main() -> int:
     rtc_refill_threshold: int | None = None
 
     gripper_hold_requirement = GripperHoldRequirement(command_count_threshold=7)
-    joint_filters = [design_butter_lowpass(cutoff=args.butter_lowpass_cutoff, fs=30.0, order=3) for _ in range(JOINT_ACTION_DIM)] # 1hz cuttoff, 30hz sampling
+    joint_filters = [design_butter_lowpass(cutoff=args.butter_lowpass_cutoff, fs=30.0, order=3) for _ in range(JOINT_ACTION_DIM)]
     zi = None
 
     try:

@@ -70,7 +70,7 @@ From the repo root, verify the two main entry points:
 uv run --project lerobot --python 3.13 \
   --extra smolvla \
   --extra intelrealsense \
-  python franka_xr_teleop/tools/run_smolvla_policy.py --help
+  python franka_xr_teleop/tools/run_vla_policy.py --help
 ```
 
 ---
@@ -96,7 +96,7 @@ This separation is what lets a 450M–3.3B parameter model drive a real-time arm
 | Path | Description |
 |------|-------------|
 | `franka_xr_teleop/cpp/teleop_bridge/` | Real-time C++ bridge: XR/policy command sources, planner, safety validation, libfranka control loop |
-| `franka_xr_teleop/tools/run_smolvla_policy.py` | The deployment runner: loads a LeRobot policy and streams joint targets to the bridge over UDP |
+| `franka_xr_teleop/tools/run_vla_policy.py` | The deployment runner: loads a LeRobot policy and streams joint targets to the bridge over UDP |
 | `franka_xr_teleop/tools/record_data_collection_session.py` | Launches synchronised robot + camera recorders for one collection session |
 | `franka_xr_teleop/tools/record_robot_observations.py` | Records UDP robot observations and episode markers to JSONL |
 | `franka_xr_teleop/tools/record_realsense_camera.py`, `franka_xr_teleop/tools/record_zed_camera.py` | Timestamped camera recorders for dataset sync |
