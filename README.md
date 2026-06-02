@@ -2,7 +2,7 @@
 
 > XR teleoperation, data collection, and closed-loop Vision-Language-Action (VLA) policy deployment on a 7-DOF Franka Emika Panda, for autonomous electrical connector (MSD plug) insertion.
 
-<img src="media/franka_smolvla_640_15.gif" alt="SmolVLA policy controlling the Franka Panda for MSD plug insertion" width="640">
+<img src="media/franka_smolvla_640_30.gif" alt="SmolVLA policy controlling the Franka Panda for MSD plug insertion" width="640">
 
 ## At a Glance
 
